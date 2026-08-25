@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Poll GPUs with NVML and auto-launch a job once the requested cards are stably free"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-dependencies = ["nvidia-ml-py>=12"]
+dependencies = ["nvidia-ml-py>=12", "PyYAML>=5.4"]
 
 [project.scripts]
 gpu-hunter = "gpu_hunter.cli:main"
