@@ -1,4 +1,8 @@
-"""轮询状态机:滑动窗口判定"稳定空闲",按优先级挑卡,凑齐即出手。"""
+"""轮询状态机:滑动窗口判定"稳定空闲",按优先级挑卡。
+
+AvailabilityTracker 维护每张卡的原始采样窗口;空闲谓词(严格/带显存需求)
+在读取时套用,供单任务 Hunter 与多任务 Scheduler 共用。
+"""
 from __future__ import annotations
 
 import threading
@@ -34,15 +38,30 @@ class HuntConfig:
             raise ValueError("stable_rounds 必须 >= 1")
 
 
-def is_idle(info: GpuInfo, cfg: HuntConfig) -> bool:
-    """有计算进程一律视为占用;再按利用率/显存阈值判定。"""
+def passes(
+    info: GpuInfo,
+    *,
+    idle_mem_mb: int,
+    idle_util: int,
+    need_mb: int | None = None,
+) -> bool:
+    """单个采样的空闲判定:有计算进程一律占用;再按利用率与显存条件。"""
     if info.compute_pids:
         return False
-    if info.util_percent >= 0 and info.util_percent > cfg.idle_util:
+    if info.util_percent >= 0 and info.util_percent > idle_util:
         return False
-    if cfg.mem_per_gpu_mb is not None:
-        return info.mem_free_mb >= cfg.mem_per_gpu_mb
-    return info.mem_used_mb <= cfg.idle_mem_mb
+    if need_mb is not None:
+        return info.mem_free_mb >= need_mb
+    return info.mem_used_mb <= idle_mem_mb
+
+
+def is_idle(info: GpuInfo, cfg: HuntConfig) -> bool:
+    return passes(
+        info,
+        idle_mem_mb=cfg.idle_mem_mb,
+        idle_util=cfg.idle_util,
+        need_mb=cfg.mem_per_gpu_mb,
+    )
 
 
 def rank_candidates(ids: Iterable[int], prefer: Sequence[int]) -> list[int]:
@@ -51,7 +70,56 @@ def rank_candidates(ids: Iterable[int], prefer: Sequence[int]) -> list[int]:
     return sorted(set(ids), key=lambda g: (order.get(g, len(order)), g))
 
 
+class AvailabilityTracker:
+    """按卡维护原始采样滑窗;occupied 的卡清空历史(释放后需重新稳定)。"""
+
+    def __init__(
+        self,
+        idle_mem_mb: int = 500,
+        idle_util: int = 5,
+        stable_rounds: int = 3,
+    ) -> None:
+        self.idle_mem_mb = idle_mem_mb
+        self.idle_util = idle_util
+        self.stable_rounds = stable_rounds
+        self.windows: dict[int, deque[GpuInfo]] = {}
+
+    def _ok(self, info: GpuInfo, need_mb: int | None) -> bool:
+        return passes(
+            info,
+            idle_mem_mb=self.idle_mem_mb,
+            idle_util=self.idle_util,
+            need_mb=need_mb,
+        )
+
+    def update(
+        self,
+        snap: dict[int, GpuInfo],
+        occupied: Iterable[int] = (),
+    ) -> None:
+        occ = set(occupied)
+        self.windows = {
+            g: w for g, w in self.windows.items() if g in snap and g not in occ
+        }
+        for gid, info in snap.items():
+            if gid in occ:
+                continue
+            w = self.windows.setdefault(gid, deque(maxlen=self.stable_rounds))
+            w.append(info)
+
+    def stable(self, mem_per_gpu_mb: int | None = None) -> set[int]:
+        """最近 stable_rounds 轮全部满足空闲条件的卡。"""
+        return {
+            g
+            for g, w in self.windows.items()
+            if len(w) == self.stable_rounds
+            and all(self._ok(s, mem_per_gpu_mb) for s in w)
+        }
+
+
 class Hunter:
+    """单任务守候:阻塞到凑齐稳定空闲卡为止。"""
+
     def __init__(
         self,
         probe: Probe,
@@ -67,7 +135,7 @@ class Hunter:
     def hunt(self) -> list[int] | None:
         """阻塞直到凑齐稳定空闲的卡并返回卡号;被中止/超限时返回 None。"""
         cfg = self.cfg
-        windows: dict[int, deque[bool]] = {}
+        tracker = AvailabilityTracker(cfg.idle_mem_mb, cfg.idle_util, cfg.stable_rounds)
         polls = 0
         last_status = ""
         err_streak = 0
@@ -83,7 +151,7 @@ class Hunter:
                     self.emit(f"警告:读取 GPU 状态失败({e}),继续重试")
                 snap = {}
 
-            windows = {g: w for g, w in windows.items() if g in snap}
+            tracker.update(snap)
             eligible = [g for g in sorted(snap) if cfg.allow is None or g in cfg.allow]
 
             if snap and not warned_refs:
@@ -92,22 +160,14 @@ class Hunter:
                     self.emit(f"警告:配置引用了不存在的 GPU 编号 {ghost},已忽略")
                 warned_refs = True
 
-            for gid in eligible:
-                w = windows.setdefault(gid, deque(maxlen=cfg.stable_rounds))
-                w.append(is_idle(snap[gid], cfg))
-
-            stable = [
-                g
-                for g in eligible
-                if len(windows[g]) == cfg.stable_rounds and all(windows[g])
-            ]
-            ranked = rank_candidates(stable, cfg.prefer)
+            stable = tracker.stable(cfg.mem_per_gpu_mb)
+            ranked = rank_candidates((g for g in eligible if g in stable), cfg.prefer)
             if len(ranked) >= cfg.need:
                 chosen = ranked[: cfg.need]
                 self.emit(f"命中空闲 GPU {chosen}")
                 return chosen
 
-            status = self._render(eligible, snap, windows, cfg)
+            status = self._render(eligible, snap, tracker, cfg)
             if status != last_status:
                 self.emit(status)
                 last_status = status
@@ -122,13 +182,13 @@ class Hunter:
     def _render(
         eligible: Sequence[int],
         snap: dict[int, GpuInfo],
-        windows: dict[int, deque[bool]],
+        tracker: AvailabilityTracker,
         cfg: HuntConfig,
     ) -> str:
         segs = []
         for gid in eligible:
-            w = windows.get(gid)
-            streak = f"{sum(w)}/{len(w)}" if w else f"0/{cfg.stable_rounds}"
+            w = tracker.windows.get(gid)
+            streak = f"{sum(is_idle(s, cfg) for s in w)}/{len(w)}" if w else f"0/{cfg.stable_rounds}"
             state = "ok" if is_idle(snap[gid], cfg) else "--"
             info = snap[gid]
             segs.append(
