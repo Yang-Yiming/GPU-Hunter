@@ -91,16 +91,20 @@ def verify_claim(
     *,
     grace_s: float = 30.0,
     poll_s: float = 2.0,
+    foreign_stable_s: float = 8.0,
     stop=None,
 ) -> str:
     """宽限期内确认子进程确实占到了卡。
 
-    confirmed: 在目标卡上看到子进程 pid;
-    lost:      目标卡上出现了别人的计算进程(被抢);
-    unknown:   超时仍没看到(任务可能尚未初始化 CUDA,或容器内 pid 不可见)。
+    confirmed: 任一目标卡上看到子进程 pid(多进程任务如 torchrun 的
+               worker pid 视为"自己人"的误伤源,因此见到自家 pid 即放行);
+    lost:      目标卡上持续出现别人的计算进程超过 foreign_stable_s 秒,
+               且始终未见本进程 —— 判定被抢;
+    unknown:   超时仍没看到任何进程(任务可能尚未初始化 CUDA,或容器内 pid 不可见)。
     """
     gpus = tuple(gpus)
     deadline = time.monotonic() + max(grace_s, 0.0)
+    foreign_since: float | None = None
     while True:
         if stop is not None and stop.is_set():
             return CLAIM_UNKNOWN
@@ -109,23 +113,28 @@ def verify_claim(
         except Exception:
             snap = {}
         mine = False
-        foreign: list[tuple[int, tuple[int, ...]]] = []
+        foreign = False
         for g in gpus:
             gi = snap.get(g)
             if gi is None:
                 continue
             if child_pid in gi.compute_pids:
                 mine = True
-            others = tuple(p for p in gi.compute_pids if p != child_pid)
-            if others:
-                foreign.append((g, others))
+            elif any(p != child_pid for p in gi.compute_pids):
+                foreign = True
+        now = time.monotonic()
         if mine:
             return CLAIM_CONFIRMED
         if foreign:
-            return CLAIM_LOST
-        if time.monotonic() >= deadline:
+            if foreign_since is None:
+                foreign_since = now
+            elif now - foreign_since >= foreign_stable_s:
+                return CLAIM_LOST
+        else:
+            foreign_since = None
+        if now >= deadline:
             return CLAIM_UNKNOWN
-        remaining = deadline - time.monotonic()
+        remaining = deadline - now
         nap = min(poll_s, max(0.05, remaining))
         if stop is not None:
             stop.wait(nap)

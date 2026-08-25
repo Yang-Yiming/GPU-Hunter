@@ -61,8 +61,8 @@ class Hunter:
     ) -> None:
         self.probe = probe
         self.cfg = cfg
-        self.emit = emit or print
-        self.stop = stop_event or threading.Event()
+        self.emit = emit if emit is not None else print
+        self.stop = stop_event if stop_event is not None else threading.Event()
 
     def hunt(self) -> list[int] | None:
         """阻塞直到凑齐稳定空闲的卡并返回卡号;被中止/超限时返回 None。"""
