@@ -81,7 +81,7 @@ def split_argv(argv: Sequence[str]) -> tuple[list[str], list[str] | None]:
 
 _EPILOG = """\
 示例:
-  gpu-hunter --gpus 2 --prefer 2,3 -- python train.py --epochs 100
+  gpu-hunter --gpu-num 2 --prefer 2,3 -- python train.py --epochs 100
   gpu-hunter --mem-per-gpu 40G --log runs/train.log -- bash run.sh
   gpu-hunter -v --interval 3 --stable-rounds 4 -- ./long_job.sh
 
@@ -97,7 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--gpus", type=int, default=1, metavar="N",
+    p.add_argument("--gpu-num", type=int, default=1, metavar="N",
                    help="需要几张同时空闲的卡(默认 1)")
     p.add_argument("--mem-per-gpu", type=parse_size_mb, default=None, metavar="SIZE",
                    help="单卡显存需求,如 40G / 24000M;缺省表示要求卡完全空闲")
@@ -245,7 +245,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     cmd = [str(t) for t in (cmd_tokens or [])]
     if not cmd:
         parser.error('缺少待执行命令:请用 "--" 分隔选项与命令,'
-                     "例如 gpu-hunter --gpus 1 -- python train.py")
+                     "例如 gpu-hunter --gpu-num 1 -- python train.py")
     cmd = _wrap_script(cmd)
 
     try:
@@ -255,7 +255,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     cfg = HuntConfig(
-        need=ns.gpus,
+        need=ns.gpu_num,
         mem_per_gpu_mb=ns.mem_per_gpu,
         prefer=tuple(ns.prefer) if ns.prefer else (),
         allow=frozenset(ns.allow) if ns.allow else None,

@@ -83,8 +83,8 @@ class ParseListTest(unittest.TestCase):
 
 class SplitArgvTest(unittest.TestCase):
     def test_with_marker(self):
-        opts, cmd = split_argv(["-v", "--gpus", "2", "--", "python", "x.py"])
-        self.assertEqual(opts, ["-v", "--gpus", "2"])
+        opts, cmd = split_argv(["-v", "--gpu-num", "2", "--", "python", "x.py"])
+        self.assertEqual(opts, ["-v", "--gpu-num", "2"])
         self.assertEqual(cmd, ["python", "x.py"])
 
     def test_without_marker(self):
