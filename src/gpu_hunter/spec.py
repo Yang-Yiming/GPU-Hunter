@@ -31,7 +31,8 @@ class JobSpec:
     prefer: tuple[int, ...] = ()
     allow: frozenset[int] | None = None
     env: dict[str, str] = field(default_factory=dict)
-    log: Path | None = None          # None → 调度器自动生成;- 透传终端
+    log: Path | None = None            # None + passthrough_log=False → 调度器自动生成
+    passthrough_log: bool = False      # log: "-" 时为 True,输出透传终端
     cwd: Path | None = None
 
 
@@ -141,9 +142,10 @@ def _build_job(raw, index: int, defaults: dict) -> JobSpec:
 
     log_v = raw.get("log", defaults.get("log"))
     log_path = None
+    passthrough = False
     if log_v is not None:
         if isinstance(log_v, str) and log_v.strip() == "-":
-            log_path = None
+            passthrough = True
         else:
             log_path = coerce_path(log_v, f"{ctx}.log")
 
@@ -159,6 +161,7 @@ def _build_job(raw, index: int, defaults: dict) -> JobSpec:
         allow=allow,
         env=env,
         log=log_path,
+        passthrough_log=passthrough,
         cwd=cwd,
     )
 

@@ -20,8 +20,10 @@ class ProbeLike(Protocol):
     def snapshot(self) -> dict[int, "GpuInfo"]: ...
 
 
-def build_child_env(gpus: Sequence[int]) -> dict[str, str]:
+def build_child_env(gpus: Sequence[int], extra: dict[str, str] | None = None) -> dict[str, str]:
     env = dict(os.environ)
+    if extra:
+        env.update(extra)
     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpus)
     return env
 
@@ -31,6 +33,7 @@ def launch(
     gpus: Sequence[int],
     log_path: Path | None = None,
     cwd: str | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> tuple[subprocess.Popen, IO[bytes] | None]:
     """以独立会话启动子进程;给了 log_path 就把输出重定向进去,否则透传终端。"""
     fout: IO[bytes] | None = None
@@ -41,7 +44,7 @@ def launch(
     try:
         proc = subprocess.Popen(
             [str(c) for c in cmd],
-            env=build_child_env(gpus),
+            env=build_child_env(gpus, extra_env),
             stdout=fout if fout else None,
             stderr=subprocess.STDOUT if fout else None,
             stdin=subprocess.DEVNULL,
@@ -143,18 +146,27 @@ def verify_claim(
 
 
 class SignalBridge:
-    """把 SIGINT/SIGTERM 转发给子进程组;没有子进程时转为 KeyboardInterrupt。
+    """把 SIGINT/SIGTERM 转发给所有在管子进程组;没有子进程时转为 KeyboardInterrupt。
 
-    5 秒内连按两次同一个信号视为"急停",直接 SIGKILL 整个进程组。
+    通过 attach()/detach() 登记子进程;5 秒内连按两次同一个信号视为
+    "急停",对全部进程组 SIGKILL。
     """
 
     ESCALATE_WINDOW = 5.0
 
     def __init__(self) -> None:
-        self.proc: subprocess.Popen | None = None
+        self.procs: list[subprocess.Popen] = []
         self._prev: dict[signal.Signals, object] = {}
         self._last_sig: signal.Signals | None = None
         self._last_t = 0.0
+
+    def attach(self, proc: subprocess.Popen) -> None:
+        if proc not in self.procs:
+            self.procs.append(proc)
+
+    def detach(self, proc: subprocess.Popen) -> None:
+        if proc in self.procs:
+            self.procs.remove(proc)
 
     def install(self) -> None:
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -165,9 +177,15 @@ class SignalBridge:
             signal.signal(sig, handler)
         self._prev.clear()
 
+    def terminate_all(self, term_wait: float = 10.0) -> None:
+        """ orderly 杀掉全部在管子进程(Ctrl-C 清理用)。"""
+        for proc in list(self.procs):
+            terminate_tree(proc, term_wait=term_wait)
+            self.detach(proc)
+
     def follow(self, proc: subprocess.Popen, status_fn=None, heartbeat_s: float = 120.0) -> int:
-        """跟随子进程直到退出;期间按心跳周期输出状态。返回原始 returncode。"""
-        self.proc = proc
+        """跟随单个子进程直到退出(单任务模式);期间按心跳周期输出状态。"""
+        self.attach(proc)
         last_beat = time.monotonic()
         try:
             while True:
@@ -183,16 +201,18 @@ class SignalBridge:
                         pass
                 time.sleep(0.5)
         finally:
-            self.proc = None
+            self.detach(proc)
 
     def _handle(self, signum, _frame) -> None:
-        proc = self.proc
-        if proc is None or proc.poll() is not None:
+        live = [p for p in self.procs if p.poll() is None]
+        if not live:
             raise KeyboardInterrupt
         now = time.monotonic()
         if signum == self._last_sig and now - self._last_t < self.ESCALATE_WINDOW:
-            _send_group(proc, signal.SIGKILL)
+            for p in live:
+                _send_group(p, signal.SIGKILL)
             return
         self._last_sig = signum
         self._last_t = now
-        _send_group(proc, signum)
+        for p in live:
+            _send_group(p, signum)
