@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import math
-import re
 import shlex
 import signal
 import sys
@@ -13,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Sequence
 
-from . import __version__
+from . import __version__, parsing
 from .lock import instance_lock
 from .runner import (
     CLAIM_LOST,
@@ -31,42 +29,18 @@ log = logging.getLogger("gpu-hunter")
 
 # ---------- 参数解析辅助 ----------
 
-_UNITS = {
-    "": 2**20, "B": 1,
-    "K": 2**10, "KB": 2**10, "KIB": 2**10,
-    "M": 2**20, "MB": 2**20, "MIB": 2**20,
-    "G": 2**30, "GB": 2**30, "GIB": 2**30,
-    "T": 2**40, "TB": 2**40, "TIB": 2**40,
-}
-
-
 def parse_size_mb(text: str) -> int:
-    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([A-Za-z]*)\s*", text)
-    if not m:
-        raise argparse.ArgumentTypeError(f"无法解析容量:{text!r}(示例 500 / 24000M / 40G)")
-    unit = m.group(2).upper()
-    if unit not in _UNITS:
-        raise argparse.ArgumentTypeError(f"未知容量单位:{m.group(2)!r}")
-    return math.ceil(float(m.group(1)) * _UNITS[unit] / 2**20)
+    try:
+        return parsing.parse_size_mb(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
 
 
 def parse_int_list(text: str) -> list[int]:
-    out: list[int] = []
-    for tok in text.split(","):
-        tok = tok.strip()
-        if not tok:
-            continue
-        try:
-            v = int(tok)
-        except ValueError:
-            raise argparse.ArgumentTypeError(f"非法 GPU 编号:{tok!r}") from None
-        if v < 0:
-            raise argparse.ArgumentTypeError(f"GPU 编号不能为负:{v}")
-        if v not in out:
-            out.append(v)
-    if not out:
-        raise argparse.ArgumentTypeError("列表为空")
-    return out
+    try:
+        return parsing.parse_int_list(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
 
 
 def split_argv(argv: Sequence[str]) -> tuple[list[str], list[str] | None]:
@@ -127,15 +101,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _wrap_script(cmd: list[str]) -> list[str]:
     """用户按最初设想直接给一个脚本文件时,自动补上解释器。"""
-    if len(cmd) == 1:
-        s = cmd[0]
-        if s.endswith(".py"):
-            log.info("检测到 .py 脚本,自动改为 %s 执行", sys.executable)
-            return [sys.executable, s]
-        if s.endswith(".sh"):
-            log.info("检测到 .sh 脚本,自动使用 bash 执行")
-            return ["bash", s]
-    return cmd
+    wrapped = parsing.ensure_interpreter(cmd)
+    if wrapped != cmd:
+        log.info("检测到脚本参数,自动补全解释器:%s", shlex.join(wrapped))
+    return wrapped
 
 
 def _fmt_dur(sec: float) -> str:
