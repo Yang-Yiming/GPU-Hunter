@@ -96,6 +96,7 @@ def verify_claim(
     poll_s: float = 2.0,
     foreign_stable_s: float = 8.0,
     stop=None,
+    give_up=None,
 ) -> str:
     """宽限期内确认子进程确实占到了卡。
 
@@ -103,13 +104,16 @@ def verify_claim(
                worker pid 视为"自己人"的误伤源,因此见到自家 pid 即放行);
     lost:      目标卡上持续出现别人的计算进程超过 foreign_stable_s 秒,
                且始终未见本进程 —— 判定被抢;
-    unknown:   超时仍没看到任何进程(任务可能尚未初始化 CUDA,或容器内 pid 不可见)。
+    unknown:   超时仍没看到任何进程(任务可能尚未初始化 CUDA,或容器内 pid 不可见),
+               或 give_up() 为真(如子进程已提前退出)。
     """
     gpus = tuple(gpus)
     deadline = time.monotonic() + max(grace_s, 0.0)
     foreign_since: float | None = None
     while True:
         if stop is not None and stop.is_set():
+            return CLAIM_UNKNOWN
+        if give_up is not None and give_up():
             return CLAIM_UNKNOWN
         try:
             snap = probe.snapshot()

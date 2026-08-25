@@ -193,7 +193,7 @@ class Scheduler:
             + (f"(日志:{log_path})" if log_path else "")
         )
 
-        verdict = self._verify(proc.pid, gpus)
+        verdict = self._verify(proc, gpus)
         if proc.poll() is not None:
             self._retire(spec, proc, fout, gpus, started, attempts)
             return
@@ -221,8 +221,12 @@ class Scheduler:
             )
         )
 
-    def _default_verify(self, pid: int, gpus: tuple[int, ...]):
-        return verify_claim(self.probe, pid, gpus, grace_s=self.wf.grace_s, stop=self.stop)
+    def _default_verify(self, proc, gpus: tuple[int, ...]):
+        return verify_claim(
+            self.probe, proc.pid, gpus,
+            grace_s=self.wf.grace_s, stop=self.stop,
+            give_up=lambda: proc.poll() is not None,
+        )
 
     # ---------- 收割与善后 ----------
 

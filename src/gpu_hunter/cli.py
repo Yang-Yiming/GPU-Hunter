@@ -173,6 +173,7 @@ def _hunt_and_run(probe, cfg: HuntConfig, ns, cmd: list[str], stop: threading.Ev
         verdict = verify_claim(
             probe, proc.pid, gpus,
             grace_s=ns.grace, stop=stop,
+            give_up=lambda p=proc: p.poll() is not None,
         )
         if proc.poll() is not None:
             rc = _norm_rc(proc.returncode)

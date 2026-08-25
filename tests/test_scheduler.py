@@ -71,7 +71,7 @@ class LaunchRecorder:
         return proc, None
 
 
-def run_scheduler(probe, workflow, recorder, verify=lambda pid, gpus: CLAIM_CONFIRMED,
+def run_scheduler(probe, workflow, recorder, verify=lambda proc, gpus: CLAIM_CONFIRMED,
                   stop_event=None, max_ticks=50):
     with patch.object(sched_mod, "launch", recorder), \
          patch.object(sched_mod, "terminate_tree") as term:
@@ -179,7 +179,7 @@ class PreemptTest(unittest.TestCase):
     def test_lost_rolls_back_and_retries(self):
         seq = iter([CLAIM_LOST, CLAIM_CONFIRMED])
         rec = LaunchRecorder([FakeProc(), FakeProc(done_after_polls=2)])
-        verify = lambda pid, gpus: next(seq)  # noqa: E731
+        verify = lambda proc, gpus: next(seq)  # noqa: E731
         s, results, term = run_scheduler(
             FakeProbe(FREE1 * 8), wf([job("a")]), rec, verify=verify
         )
@@ -196,7 +196,7 @@ class PreemptTest(unittest.TestCase):
             [FakeProc(), FakeProc(rc_immediate=0), FakeProc(done_after_polls=2)]
         )
 
-        def verify(pid, gpus):
+        def verify(proc, gpus):
             return next(seq)
 
         _, results, term = run_scheduler(
