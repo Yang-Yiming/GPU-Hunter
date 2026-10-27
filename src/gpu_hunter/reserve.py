@@ -57,7 +57,8 @@ __all__ = [
 STATE_VERSION = 1
 HOG_MODULE = "gpu_hunter.hog"
 DEFAULT_HOLD_MAX_S = 12 * 3600.0
-FULL_MARGIN_MB = 512          # leave this much free when reserving a whole card
+FULL_MARGIN_MB = 1024         # leave this much free when reserving a whole card
+                              # (covers the CUDA context overhead on top of the request)
 HOLD_CONFIRM_S = 30.0         # how long a placeholder gets to prove it allocated
 
 Emit = Callable[[str], None]

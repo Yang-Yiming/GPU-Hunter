@@ -168,6 +168,10 @@ Notes:
 - A plain `--release` prints `export CUDA_VISIBLE_DEVICES=...`, but the window
   between releasing and your command actually allocating has a small race
   window; prefer `--release --run` for a real hand-off.
+- A placeholder allocates the exact `--mem-per-gpu` amount *on top of* the
+  CUDA context overhead (a few hundred MB). Asking for nearly all of a card's
+  free memory can therefore fail to allocate and retry forever; use a
+  slightly smaller value or `--reserve-full` (which keeps ~1G free) instead.
 
 Reserve options: `--reserve`, `--detach`, `--hold-max SEC`, `--reserve-full`,
 `--hold-cmd CMD`, `--reserve-status`, `--release`, `--run`, `--force`.
