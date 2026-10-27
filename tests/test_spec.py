@@ -107,7 +107,7 @@ class WorkflowSpecTest(unittest.TestCase):
         self.assertAlmostEqual(wf.grace_s, 10.0)
 
     def test_duplicate_names_rejected(self):
-        with self.assertRaisesRegex(SpecError, "name 重复"):
+        with self.assertRaisesRegex(SpecError, "duplicate name"):
             self.load(
                 """
                 jobs:
@@ -117,19 +117,19 @@ class WorkflowSpecTest(unittest.TestCase):
             )
 
     def test_unknown_top_level_key(self):
-        with self.assertRaisesRegex(SpecError, "未知顶层字段"):
+        with self.assertRaisesRegex(SpecError, "unknown top-level fields"):
             self.load("jobs: [{cmd: x}]\ngpu_nmu: 1\n")
 
     def test_unknown_job_key(self):
-        with self.assertRaisesRegex(SpecError, "未知字段"):
+        with self.assertRaisesRegex(SpecError, "unknown fields"):
             self.load("jobs:\n  - cmd: x\n    gpu_nums: 2\n")
 
     def test_missing_cmd(self):
-        with self.assertRaisesRegex(SpecError, "缺少必填字段 cmd"):
+        with self.assertRaisesRegex(SpecError, "missing required field cmd"):
             self.load("jobs:\n  - name: a\n")
 
     def test_empty_jobs(self):
-        with self.assertRaisesRegex(SpecError, "非空列表"):
+        with self.assertRaisesRegex(SpecError, "non-empty list"):
             self.load("jobs: []\n")
 
     def test_bad_schedule(self):
@@ -141,15 +141,15 @@ class WorkflowSpecTest(unittest.TestCase):
             self.load("jobs: [{cmd: x, gpu-num: 0}]\n")
 
     def test_bad_size(self):
-        with self.assertRaisesRegex(SpecError, "容量"):
+        with self.assertRaisesRegex(SpecError, "size"):
             self.load("jobs: [{cmd: x, mem-per-gpu: 40Q}]\n")
 
     def test_bad_yaml_syntax(self):
-        with self.assertRaisesRegex(SpecError, "YAML 语法错误"):
+        with self.assertRaisesRegex(SpecError, "YAML syntax error"):
             self.load("jobs: [\n")
 
     def test_missing_file(self):
-        with self.assertRaisesRegex(SpecError, "不存在"):
+        with self.assertRaisesRegex(SpecError, "does not exist"):
             load_workflow(self.tmp / "nope.yaml")
 
 

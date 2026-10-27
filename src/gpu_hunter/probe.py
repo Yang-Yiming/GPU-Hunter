@@ -1,4 +1,4 @@
-"""GPU 状态探测:直接走 NVML(nvidia-smi 的底层库),不解析文本输出。"""
+"""GPU state probing: talks to NVML directly (the library behind nvidia-smi), no text parsing."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -60,21 +60,24 @@ def _compute_pids(handle) -> tuple[int, ...]:
 
 
 class NVMLProbe:
-    """每次 snapshot() 返回 {gpu_index: GpuInfo}。"""
+    """Each snapshot() call returns {gpu_index: GpuInfo}."""
 
     def __init__(self) -> None:
         if pynvml is None:
-            raise ProbeError("缺少依赖 nvidia-ml-py:pip install nvidia-ml-py")
+            raise ProbeError("missing dependency nvidia-ml-py: pip install nvidia-ml-py")
         try:
             pynvml.nvmlInit()
         except pynvml.NVMLError as e:
-            raise ProbeError(f"NVML 初始化失败:{e}(驱动未加载或没有 NVIDIA 设备?)") from e
+            raise ProbeError(
+                f"NVML initialization failed: {e} "
+                "(driver not loaded or no NVIDIA device present?)"
+            ) from e
         try:
             count = pynvml.nvmlDeviceGetCount()
             self._handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(count)]
         except pynvml.NVMLError as e:
             self.close()
-            raise ProbeError(f"枚举 GPU 失败:{e}") from e
+            raise ProbeError(f"failed to enumerate GPUs: {e}") from e
         self._names = [_name_of(h) for h in self._handles]
 
     def snapshot(self) -> dict[int, GpuInfo]:
@@ -88,7 +91,7 @@ class NVMLProbe:
                 except pynvml.NVMLError:
                     util = -1
             except pynvml.NVMLError as e:
-                raise ProbeError(f"读取 GPU{i} 状态失败:{e}") from e
+                raise ProbeError(f"failed to read state of GPU{i}: {e}") from e
             out[i] = GpuInfo(
                 index=i,
                 name=self._names[i],

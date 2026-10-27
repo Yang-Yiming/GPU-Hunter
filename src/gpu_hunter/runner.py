@@ -1,4 +1,4 @@
-"""任务启动与运行期管理:CUDA 设备绑定、抢占校验、进程组信号转发。"""
+"""Job launch and runtime management: CUDA device binding, claim verification, process-group signals."""
 from __future__ import annotations
 
 import os
@@ -35,7 +35,7 @@ def launch(
     cwd: str | None = None,
     extra_env: dict[str, str] | None = None,
 ) -> tuple[subprocess.Popen, IO[bytes] | None]:
-    """以独立会话启动子进程;给了 log_path 就把输出重定向进去,否则透传终端。"""
+    """Start the child in its own session; redirect output to log_path when given."""
     fout: IO[bytes] | None = None
     if log_path is not None:
         log_path = Path(log_path)
@@ -77,7 +77,7 @@ def _send_group(proc: subprocess.Popen, sig: signal.Signals) -> None:
 
 
 def terminate_tree(proc: subprocess.Popen, term_wait: float = 10.0) -> None:
-    """先 TERM 后 KILL,作用于整个进程组(覆盖 sh 包一层脚本的情况)。"""
+    """Send TERM, then KILL, to the whole process group (covers a wrapping shell)."""
     for sig, wait_s in ((signal.SIGTERM, term_wait), (signal.SIGKILL, 5.0)):
         _send_group(proc, sig)
         deadline = time.monotonic() + wait_s
@@ -98,14 +98,16 @@ def verify_claim(
     stop=None,
     give_up=None,
 ) -> str:
-    """宽限期内确认子进程确实占到了卡。
+    """Confirm within the grace period that the child really got the GPUs.
 
-    confirmed: 任一目标卡上看到子进程 pid(多进程任务如 torchrun 的
-               worker pid 视为"自己人"的误伤源,因此见到自家 pid 即放行);
-    lost:      目标卡上持续出现别人的计算进程超过 foreign_stable_s 秒,
-               且始终未见本进程 —— 判定被抢;
-    unknown:   超时仍没看到任何进程(任务可能尚未初始化 CUDA,或容器内 pid 不可见),
-               或 give_up() 为真(如子进程已提前退出)。
+    confirmed: the child pid shows up on any target GPU (multi-process jobs such
+               as torchrun have different worker pids, so seeing our own pid is
+               enough to avoid false preemption);
+    lost:      another process shows up continuously on the target GPUs for
+               longer than foreign_stable_s while ours is never seen;
+    unknown:   nothing was seen before the timeout (the job may not have
+               initialized CUDA yet, or container pids are invisible), or
+               give_up() returned true (e.g. the child already exited).
     """
     gpus = tuple(gpus)
     deadline = time.monotonic() + max(grace_s, 0.0)
@@ -150,10 +152,11 @@ def verify_claim(
 
 
 class SignalBridge:
-    """把 SIGINT/SIGTERM 转发给所有在管子进程组;没有子进程时转为 KeyboardInterrupt。
+    """Forward SIGINT/SIGTERM to every managed child process group.
 
-    通过 attach()/detach() 登记子进程;5 秒内连按两次同一个信号视为
-    "急停",对全部进程组 SIGKILL。
+    Children are registered via attach()/detach(); two presses of the same
+    signal within 5 seconds count as an emergency stop and SIGKILL every
+    process group.
     """
 
     ESCALATE_WINDOW = 5.0
@@ -182,13 +185,13 @@ class SignalBridge:
         self._prev.clear()
 
     def terminate_all(self, term_wait: float = 10.0) -> None:
-        """ orderly 杀掉全部在管子进程(Ctrl-C 清理用)。"""
+        """Kill every managed child in order (used for Ctrl-C cleanup)."""
         for proc in list(self.procs):
             terminate_tree(proc, term_wait=term_wait)
             self.detach(proc)
 
     def follow(self, proc: subprocess.Popen, status_fn=None, heartbeat_s: float = 120.0) -> int:
-        """跟随单个子进程直到退出(单任务模式);期间按心跳周期输出状态。"""
+        """Follow a single child until it exits (single-job mode), emitting status per heartbeat."""
         self.attach(proc)
         last_beat = time.monotonic()
         try:

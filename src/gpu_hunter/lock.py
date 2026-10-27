@@ -1,4 +1,4 @@
-"""进程级单实例锁:防止同时开多个 gpu-hunter 双倍占卡。"""
+"""Process-level single-instance lock: prevents running multiple gpu-hunter copies."""
 from __future__ import annotations
 
 import fcntl
@@ -17,7 +17,10 @@ def instance_lock(name: str = "gpu-hunter"):
         try:
             fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise SystemExit(f"检测到另一个 {name} 实例正在运行(锁文件:{d / 'instance.lock'})")
+            raise SystemExit(
+                f"another {name} instance is already running "
+                f"(lock file: {d / 'instance.lock'})"
+            )
         fh.write(str(os.getpid()))
         fh.flush()
         fh.truncate()

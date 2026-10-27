@@ -14,7 +14,7 @@ from gpu_hunter.spec import JobSpec, WorkflowSpec  # noqa: E402
 
 
 class FakeProc:
-    """可编程生命周期:rc_immediate 立即结束;done_after_polls 在第 N 次 poll 后结束。"""
+    """Programmable lifecycle: rc_immediate exits at once; done_after_polls exits at poll N."""
 
     _pid_seq = 1000
 
@@ -56,12 +56,12 @@ FREE1 = [{0: gpu(0)}]
 
 
 class LaunchRecorder:
-    """替换 scheduler.launch:记录调用并按脚本返回假进程。"""
+    """Replacement for scheduler.launch: records calls and returns scripted fake processes."""
 
     def __init__(self, procs=None):
         self.calls = []          # (name, gpus, log_path, extra_env)
         self._procs = list(procs or [])
-        self.on_launch = None    # 钩子,可在发射时改变外部状态(如 set stop)
+        self.on_launch = None    # hook to mutate external state on launch (e.g. set stop)
 
     def __call__(self, cmd, gpus, log_path=None, cwd=None, extra_env=None):
         self.calls.append((list(cmd), tuple(gpus), log_path, extra_env))
@@ -92,12 +92,12 @@ class GreedyTest(unittest.TestCase):
         s, results, _ = run_scheduler(FakeProbe(FREE2 * 5), wf([job("a"), job("b")]), rec)
         self.assertEqual(len(rec.calls), 2)
         gpus_used = [c[1] for c in rec.calls]
-        self.assertEqual(len(set(gpus_used)), 2)          # 不重叠
+        self.assertEqual(len(set(gpus_used)), 2)          # no overlap
         self.assertEqual([r.name for r in results], ["a", "b"])
         self.assertTrue(all(r.ok for r in results))
 
     def test_skips_unfittable_head_keeps_scanning(self):
-        # A 要 2 张但只有 1 张空闲;B 只要 1 张 → B 应当先飞,A 继续等
+        # A needs 2 GPUs but only 1 is free; B needs 1 -> B should fly first while A waits
         frames = FREE1 * 3 + FREE2 * 6
         rec = LaunchRecorder(
             [FakeProc(done_after_polls=8), FakeProc(done_after_polls=2)]
@@ -106,8 +106,8 @@ class GreedyTest(unittest.TestCase):
             FakeProbe(frames), wf([job("a", gpu_num=2), job("b")]), rec
         )
         by_name = {r.name: r for r in results}
-        self.assertTrue(by_name["b"].ok)                  # 先飞
-        self.assertTrue(by_name["a"].ok)                  # 后面卡够了也完成
+        self.assertTrue(by_name["b"].ok)                  # launched first
+        self.assertTrue(by_name["a"].ok)                  # also completes once more GPUs free up
         b_idx = rec.calls.index(next(c for c in rec.calls if len(c[1]) == 1))
         a_idx = next(i for i, c in enumerate(rec.calls) if len(c[1]) == 2)
         self.assertLess(b_idx, a_idx)
@@ -119,7 +119,7 @@ class GreedyTest(unittest.TestCase):
         jobs = [job("a", prefer=(0,)), job("b", prefer=(0,))]
         run_scheduler(FakeProbe(FREE2 * 5), wf(jobs), rec)
         self.assertEqual(rec.calls[0][1], (0,))
-        self.assertEqual(rec.calls[1][1], (1,))           # a 拿走 0,b 兜底拿 1
+        self.assertEqual(rec.calls[1][1], (1,))           # a takes 0, b falls back to 1
 
     def test_env_forwarded(self):
         rec = LaunchRecorder([FakeProc(rc_immediate=0)])
@@ -139,7 +139,7 @@ class GreedyTest(unittest.TestCase):
 
 class SequentialTest(unittest.TestCase):
     def test_strict_order_blocks_smaller_behind(self):
-        # 队首 A 要 2 张,永远只有 1 张 → B 即使能跑也不许跑
+        # Head job A needs 2 GPUs but only 1 is ever free -> B must not run even though it could
         rec = LaunchRecorder([FakeProc()])
         s, results, _ = run_scheduler(
             FakeProbe(FREE1 * 10),
@@ -160,7 +160,7 @@ class SequentialTest(unittest.TestCase):
             FakeProbe(FREE2 * 12), wf(jobs, schedule="sequential"), rec
         )
         self.assertEqual([r.name for r in results], ["a", "b", "c"])
-        # 严格串行:a 结束后 b 才发射
+        # Strict serial execution: b launches only after a finishes
         starts = [i for i, c in enumerate(rec.calls)]
         self.assertEqual(starts, [0, 1, 2])
 
@@ -183,14 +183,15 @@ class PreemptTest(unittest.TestCase):
         s, results, term = run_scheduler(
             FakeProbe(FREE1 * 8), wf([job("a")]), rec, verify=verify
         )
-        self.assertEqual(len(rec.calls), 2)               # 尝试了两次
-        term.assert_called_once()                          # 第一次被回滚杀掉
+        self.assertEqual(len(rec.calls), 2)               # tried twice
+        term.assert_called_once()                          # first attempt rolled back and killed
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].attempts, 2)
-        self.assertEqual(s.pending, [])                    # 第二次成功离队
+        self.assertEqual(s.pending, [])                    # second attempt left the queue on success
 
     def test_rollback_releases_claim_for_next_job(self):
-        # big 被抢后释放卡;同节拍继续扫描 → small 立刻飞;small 完成后 big 重试成功
+        # big is preempted and releases the GPU; the same tick keeps scanning -> small flies
+        # immediately; once small finishes, big retries successfully
         seq = iter([CLAIM_LOST, CLAIM_CONFIRMED, CLAIM_CONFIRMED])
         rec = LaunchRecorder(
             [FakeProc(), FakeProc(rc_immediate=0), FakeProc(done_after_polls=2)]
@@ -205,7 +206,7 @@ class PreemptTest(unittest.TestCase):
             rec,
             verify=verify,
         )
-        self.assertEqual(len(rec.calls), 3)               # big 抢占 + small + big 重试
+        self.assertEqual(len(rec.calls), 3)               # big preempted + small + big retry
         term.assert_called_once()
         by_name = {r.name: r for r in results}
         self.assertTrue(by_name["small"].ok)
@@ -215,7 +216,7 @@ class PreemptTest(unittest.TestCase):
 
 class StopTest(unittest.TestCase):
     def test_stop_aborts_and_kills_children(self):
-        rec = LaunchRecorder([FakeProc()])                # 永不退出的长任务
+        rec = LaunchRecorder([FakeProc()])                # long job that never exits
         import threading
 
         stop = threading.Event()
@@ -224,8 +225,8 @@ class StopTest(unittest.TestCase):
         _, results, term = run_scheduler(
             FakeProbe(FREE1 * 5), wf([job("long")]), rec, stop_event=stop
         )
-        term.assert_called_once()                         # 回滚时终止子进程组
-        self.assertEqual(len(results), 1)                 # 记一条中止结果
+        term.assert_called_once()                         # child group terminated during rollback
+        self.assertEqual(len(results), 1)                 # one aborted result recorded
         self.assertIsNone(results[0].rc)
 
 
@@ -242,7 +243,7 @@ class SummaryTest(unittest.TestCase):
         self.assertIn("OK", lines[2])
         self.assertIn("FAIL", lines[3])
         self.assertIn("2,3", lines[2])
-        self.assertEqual(format_summary([]), "(无任务记录)")
+        self.assertEqual(format_summary([]), "(no jobs recorded)")
 
 
 if __name__ == "__main__":

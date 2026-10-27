@@ -1,7 +1,8 @@
-"""多任务调度器:贪心(默认)或严格顺序,把队列里的任务跑完。
+"""Multi-job scheduler: greedy (default) or strictly sequential, until the queue drains.
 
-每个节拍:探测 → 更新滑窗 → 按策略发射可满足的任务 → 收割退出的任务。
-资源账本 claimed 记录本调度器已分配的卡,保证并发任务互不重叠。
+Every tick: probe -> update sliding windows -> launch whatever fits under the
+strategy -> reap exited jobs. The ``claimed`` ledger records GPUs this
+scheduler has handed out, keeping concurrent jobs disjoint.
 """
 from __future__ import annotations
 
@@ -58,7 +59,7 @@ class _Running:
 
 def format_summary(results: Sequence[JobResult]) -> str:
     if not results:
-        return "(无任务记录)"
+        return "(no jobs recorded)"
     rows = [
         (
             r.name,
@@ -108,7 +109,7 @@ class Scheduler:
         self._auto_log_seq = 0
         self._err_streak = 0
 
-    # ---------- 对外主循环 ----------
+    # ---------- main loop ----------
 
     def run(self) -> list[JobResult]:
         last_beat = time.monotonic()
@@ -139,7 +140,7 @@ class Scheduler:
             self._abort_running()
         return self.results
 
-    # ---------- 发射策略 ----------
+    # ---------- launch strategies ----------
 
     def _tick_greedy(self, snap: dict) -> None:
         for spec in list(self.pending):
@@ -172,7 +173,7 @@ class Scheduler:
             return ()
         return tuple(ranked[: spec.gpu_num])
 
-    # ---------- 启动与确认 ----------
+    # ---------- launch and confirmation ----------
 
     def _launch(self, spec: JobSpec, gpus: tuple[int, ...]) -> None:
         attempts = self._attempts[spec.name] = self._attempts.get(spec.name, 0) + 1
@@ -189,8 +190,8 @@ class Scheduler:
         if self.bridge is not None:
             self.bridge.attach(proc)
         self.emit(
-            f"[{spec.name}] 已启动 pid={proc.pid} → GPU {list(gpus)}"
-            + (f"(日志:{log_path})" if log_path else "")
+            f"[{spec.name}] started pid={proc.pid} -> GPU {list(gpus)}"
+            + (f" (log: {log_path})" if log_path else "")
         )
 
         verdict = self._verify(proc, gpus)
@@ -198,7 +199,7 @@ class Scheduler:
             self._retire(spec, proc, fout, gpus, started, attempts)
             return
         if verdict == CLAIM_LOST:
-            self.emit(f"[{spec.name}] GPU {list(gpus)} 被抢占,回滚并重新排队")
+            self.emit(f"[{spec.name}] GPU {list(gpus)} was preempted; rolling back and requeueing")
             self._rollback(spec, proc, fout, gpus, requeue=True)
             return
         if self.stop.is_set():
@@ -206,7 +207,8 @@ class Scheduler:
             return
         if verdict == CLAIM_UNKNOWN:
             self.emit(
-                f"[{spec.name}] 宽限期内未确认占用(任务可能尚未初始化 CUDA),继续监控"
+                f"[{spec.name}] claim not confirmed within the grace period "
+                "(the job may not have initialized CUDA yet); continuing to monitor"
             )
         for g in gpus:
             self.claimed[g] = spec.name
@@ -228,7 +230,7 @@ class Scheduler:
             give_up=lambda: proc.poll() is not None,
         )
 
-    # ---------- 收割与善后 ----------
+    # ---------- reaping and cleanup ----------
 
     def _reap(self) -> None:
         for run in list(self.running):
@@ -259,7 +261,7 @@ class Scheduler:
                 attempts=attempts,
             )
         )
-        self.emit(f"[{spec.name}] 结束 rc={rc} 用时 {ended - started:.0f}s")
+        self.emit(f"[{spec.name}] finished rc={rc} after {ended - started:.0f}s")
 
     def _rollback(self, spec, proc, fout, gpus, *, requeue: bool) -> None:
         terminate_tree(proc)
@@ -282,7 +284,7 @@ class Scheduler:
 
     def _abort_running(self) -> None:
         for run in list(self.running):
-            self.emit(f"[{run.spec.name}] 调度器中止,终止子进程组")
+            self.emit(f"[{run.spec.name}] scheduler aborted; terminating child process group")
             terminate_tree(run.proc)
         if self.bridge is not None:
             self.bridge.terminate_all()
@@ -298,8 +300,8 @@ class Scheduler:
             if infos:
                 parts.append(f"[{run.spec.name}] " + " ".join(infos))
         queue = ",".join(s.name for s in self.pending) or "-"
-        parts.append(f"排队:{queue}")
-        self.emit("运行中 | " + " | ".join(parts))
+        parts.append(f"queued: {queue}")
+        self.emit("running | " + " | ".join(parts))
 
     def _safe_snapshot(self) -> dict:
         try:
@@ -307,5 +309,5 @@ class Scheduler:
         except Exception as e:
             self._err_streak += 1
             if self._err_streak == 1 or self._err_streak % 12 == 0:
-                self.emit(f"警告:读取 GPU 状态失败({e}),继续重试")
+                self.emit(f"warning: failed to read GPU state ({e}), retrying")
             return {}

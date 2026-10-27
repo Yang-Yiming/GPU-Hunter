@@ -168,7 +168,7 @@ class VerifyClaimTest(unittest.TestCase):
         self.assertEqual(v, CLAIM_LOST)
 
     def test_mine_on_one_of_two_is_confirmed(self):
-        # 多进程任务(worker pid 各异)只要见到自家 pid 就放行
+        # Multi-process jobs have different worker pids; seeing our own pid is enough
         snap = {2: gpu(2, pids=(4242,)), 3: gpu(3, pids=(555,))}
         probe = FakeProbe([snap])
         v = verify_claim(probe, 4242, [2, 3], grace_s=5)

@@ -1,4 +1,4 @@
-"""共享的参数/字段解析:容量、GPU 编号列表、脚本解释器补全。"""
+"""Shared argument/field parsers: sizes, GPU id lists, script interpreter completion."""
 from __future__ import annotations
 
 import math
@@ -17,20 +17,20 @@ _UNITS = {
 
 
 def parse_size_mb(text: str) -> int:
-    """'500'→500MB,'40G'/'40GiB'→40960MB;非法输入抛 ValueError。"""
+    """'500' -> 500MB, '40G'/'40GiB' -> 40960MB; invalid input raises ValueError."""
     if not isinstance(text, str):
-        raise ValueError(f"容量必须是字符串:{text!r}")
+        raise ValueError(f"size must be a string: {text!r}")
     m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([A-Za-z]*)\s*", text)
     if not m:
-        raise ValueError(f"无法解析容量:{text!r}(示例 500 / 24000M / 40G)")
+        raise ValueError(f"cannot parse size: {text!r} (examples: 500 / 24000M / 40G)")
     unit = m.group(2).upper()
     if unit not in _UNITS:
-        raise ValueError(f"未知容量单位:{m.group(2)!r}")
+        raise ValueError(f"unknown size unit: {m.group(2)!r}")
     return math.ceil(float(m.group(1)) * _UNITS[unit] / 2**20)
 
 
 def parse_int_list(value) -> list[int]:
-    """'[2,3]' 或 \"2,3\" → [2,3];去重保序;非法抛 ValueError。"""
+    """'[2,3]' or "2,3" -> [2,3]; de-duplicates while preserving order; invalid raises ValueError."""
     items: list[int] = []
     tokens: list[str]
     if isinstance(value, str):
@@ -38,7 +38,7 @@ def parse_int_list(value) -> list[int]:
     elif isinstance(value, (list, tuple)):
         tokens = [str(v) for v in value]
     else:
-        raise ValueError(f"GPU 编号列表格式非法:{value!r}")
+        raise ValueError(f"invalid GPU id list: {value!r}")
     for tok in tokens:
         tok = tok.strip()
         if not tok:
@@ -46,18 +46,18 @@ def parse_int_list(value) -> list[int]:
         try:
             v = int(tok)
         except ValueError:
-            raise ValueError(f"非法 GPU 编号:{tok!r}") from None
+            raise ValueError(f"invalid GPU id: {tok!r}") from None
         if v < 0:
-            raise ValueError(f"GPU 编号不能为负:{v}")
+            raise ValueError(f"GPU id must not be negative: {v}")
         if v not in items:
             items.append(v)
     if not items:
-        raise ValueError("GPU 编号列表为空")
+        raise ValueError("GPU id list is empty")
     return items
 
 
 def ensure_interpreter(cmd: list[str]) -> list[str]:
-    """单个 xx.py/xx.sh 自动补解释器,其余原样返回。"""
+    """Add an interpreter for a lone xx.py/xx.sh; return anything else unchanged."""
     if len(cmd) == 1:
         s = cmd[0]
         if s.endswith(".py"):
@@ -68,19 +68,19 @@ def ensure_interpreter(cmd: list[str]) -> list[str]:
 
 
 def coerce_cmd(value, ctx: str) -> list[str]:
-    """cmd 字段:字符串按 shlex 切分,或字符串列表;空则报错。"""
+    """cmd field: a string split with shlex, or a list of strings; empty is an error."""
     if isinstance(value, str):
         cmd = shlex.split(value)
     elif isinstance(value, (list, tuple)) and all(isinstance(v, str) for v in value):
         cmd = list(value)
     else:
-        raise ValueError(f"{ctx}: cmd 必须是字符串或字符串列表")
+        raise ValueError(f"{ctx}: cmd must be a string or a list of strings")
     if not cmd:
-        raise ValueError(f"{ctx}: cmd 不能为空")
+        raise ValueError(f"{ctx}: cmd must not be empty")
     return cmd
 
 
 def coerce_path(value, ctx: str) -> Path:
     if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{ctx}: 路径必须是非空字符串")
+        raise ValueError(f"{ctx}: path must be a non-empty string")
     return Path(value)

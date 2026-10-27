@@ -1,3 +1,3 @@
-"""gpu-hunter: 守望显卡,一旦出现满足条件的空闲卡就自动启动任务。"""
+"""gpu-hunter: watch GPUs and launch your job once the requested cards are free."""
 
 __version__ = "0.2.0"

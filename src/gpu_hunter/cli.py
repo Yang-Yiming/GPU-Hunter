@@ -1,4 +1,4 @@
-"""命令行入口:gpu-hunter [选项] -- <你的命令>"""
+"""Command-line entry point: gpu-hunter [options] -- <your command>"""
 from __future__ import annotations
 
 import argparse
@@ -27,7 +27,7 @@ from .watcher import HuntConfig, Hunter
 log = logging.getLogger("gpu-hunter")
 
 
-# ---------- 参数解析辅助 ----------
+# ---------- argument parsing helpers ----------
 
 def parse_size_mb(text: str) -> int:
     try:
@@ -51,63 +51,68 @@ def split_argv(argv: Sequence[str]) -> tuple[list[str], list[str] | None]:
     return argv, None
 
 
-# ---------- CLI 定义 ----------
+# ---------- CLI definition ----------
 
 _EPILOG = """\
-示例:
+Examples:
   gpu-hunter --gpu-num 2 --prefer 2,3 -- python train.py --epochs 100
   gpu-hunter --mem-per-gpu 40G --log runs/train.log -- bash run.sh
   gpu-hunter -v --interval 3 --stable-rounds 4 -- ./long_job.sh
-  gpu-hunter workflow.yaml            # 多任务队列(greedy / sequential)
+  gpu-hunter workflow.yaml            # multi-job queue (greedy / sequential)
 
-提示: 单个 xx.py / xx.sh 会自动补解释器;输出默认透传终端,后台用建议配合 nohup/tmux。
-5 秒内连按两次 Ctrl-C 强杀全部任务组。
+Tip: a lone xx.py / xx.sh gets an interpreter automatically; output goes to the
+terminal by default, so pair this with nohup/tmux when running in the background.
+Press Ctrl-C twice within 5 seconds to force-kill every job group.
 """
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="gpu-hunter",
-        description="轮询显卡状态,出现满足条件的稳定空闲卡后自动启动指定任务。",
+        description="Poll GPU state and launch the given job once enough cards are stably free.",
         epilog=_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--gpu-num", type=int, default=1, metavar="N",
-                   help="需要几张同时空闲的卡(默认 1)")
+                   help="number of simultaneously free GPUs required (default: 1)")
     p.add_argument("--mem-per-gpu", type=parse_size_mb, default=None, metavar="SIZE",
-                   help="单卡显存需求,如 40G / 24000M;缺省表示要求卡完全空闲")
+                   help="free memory required per GPU, e.g. 40G / 24000M; "
+                        "default means the card must be completely idle")
     p.add_argument("--prefer", type=parse_int_list, default=None, metavar="LIST",
-                   help="优先卡序,如 2,3(先挑 2 再挑 3)")
+                   help="preferred GPU order, e.g. 2,3 (try 2 first, then 3)")
     p.add_argument("--allow", type=parse_int_list, default=None, metavar="LIST",
-                   help="只在这些卡里挑,如 0,4,5")
+                   help="only pick from these GPUs, e.g. 0,4,5")
     p.add_argument("--interval", type=float, default=5.0, metavar="SEC",
-                   help="轮询间隔秒(默认 5)")
+                   help="polling interval in seconds (default: 5)")
     p.add_argument("--stable-rounds", type=int, default=3, metavar="K",
-                   help="连续几轮空闲才算稳定(默认 3)")
+                   help="consecutive idle rounds required for stability (default: 3)")
     p.add_argument("--idle-mem", dest="idle_mem_mb", type=parse_size_mb, default=500,
                    metavar="SIZE",
-                   help="占用低于该值视为空闲(默认 500M)")
+                   help="used memory below this value counts as idle (default: 500M)")
     p.add_argument("--grace", type=float, default=45.0, metavar="SEC",
-                   help="启动后用于确认拿到卡的宽限期秒(默认 45)")
+                   help="grace period in seconds for confirming the claim after launch "
+                        "(default: 45)")
     p.add_argument("--heartbeat", type=float, default=120.0, metavar="SEC",
-                   help="任务运行中输出状态的心跳周期秒(默认 120)")
+                   help="heartbeat interval in seconds for status output while the job runs "
+                        "(default: 120)")
     p.add_argument("--log", type=Path, default=None, metavar="FILE",
-                   help="把任务输出写入该文件;缺省透传到当前终端")
+                   help="write job output to this file; default streams to the terminal")
     p.add_argument("--cwd", default=None, metavar="DIR",
-                   help="子进程工作目录(默认继承当前目录)")
-    p.add_argument("-v", "--verbose", action="store_true", help="调试日志")
+                   help="working directory for the child process (default: current directory)")
+    p.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("workflow", nargs="?", default=None, metavar="WORKFLOW",
-                   help="YAML 工作流文件(.yaml/.yml),与 \"-- 命令\" 互斥;"
-                        "给出后进入多任务队列模式,忽略其余单任务选项")
+                   help="YAML workflow file (.yaml/.yml); mutually exclusive with \"-- command\". "
+                        "When given, enters multi-job queue mode and ignores the other "
+                        "single-job options")
     return p
 
 
 def _wrap_script(cmd: list[str]) -> list[str]:
-    """用户按最初设想直接给一个脚本文件时,自动补上解释器。"""
+    """Add an interpreter when the user passes a lone script file."""
     wrapped = parsing.ensure_interpreter(cmd)
     if wrapped != cmd:
-        log.info("检测到脚本参数,自动补全解释器:%s", shlex.join(wrapped))
+        log.info("script argument detected, adding interpreter automatically: %s", shlex.join(wrapped))
     return wrapped
 
 
@@ -136,7 +141,7 @@ def _beat(probe, gpus: Sequence[int]):
 
         parts = [describe(snap[g]) for g in gpus if g in snap]
         if parts:
-            log.info("运行中 | %s", " ".join(parts))
+            log.info("running | %s", " ".join(parts))
 
     return fn
 
@@ -145,30 +150,35 @@ def _hunt_and_run(probe, cfg: HuntConfig, ns, cmd: list[str], stop: threading.Ev
                   bridge: SignalBridge) -> int:
     hunter = Hunter(probe, cfg, emit=lambda m: log.info("%s", m), stop_event=stop)
 
-    mem_desc = f"每卡需≥{cfg.mem_per_gpu_mb}MB 显存" if cfg.mem_per_gpu_mb is not None else "要求完全空闲"
-    allow_desc = ",".join(map(str, sorted(cfg.allow))) if cfg.allow else "全部"
+    mem_desc = (
+        f"needs >= {cfg.mem_per_gpu_mb}MB free per GPU"
+        if cfg.mem_per_gpu_mb is not None
+        else "must be completely idle"
+    )
+    allow_desc = ",".join(map(str, sorted(cfg.allow))) if cfg.allow else "all"
     prefer_desc = ",".join(map(str, cfg.prefer)) or "-"
-    log.info("目标:%d 张卡(%s)| 候选范围:%s | 偏好顺序:%s",
+    log.info("target: %d GPU(s) (%s) | candidates: %s | preference: %s",
              cfg.need, mem_desc, allow_desc, prefer_desc)
-    log.info("策略:每 %.0fs 轮询 × 连续 %d 轮空闲才出手;抢卡失败退避重试",
+    log.info("strategy: poll every %.0fs, require %d consecutive idle rounds; "
+             "back off and retry if the claim is lost",
              cfg.interval_s, cfg.stable_rounds)
-    log.info("命令:%s", shlex.join(cmd))
+    log.info("command: %s", shlex.join(cmd))
 
     attempt = 0
     backoff = max(cfg.interval_s, 2.0)
     while True:
         attempt += 1
-        log.info("第 %d 次守候空闲卡…", attempt)
+        log.info("waiting for idle GPUs (attempt %d)...", attempt)
         gpus = hunter.hunt()
         if gpus is None:
-            log.info("等待被中止,退出")
+            log.info("wait aborted, exiting")
             return 130
 
         proc, fout = launch(cmd, gpus, ns.log, ns.cwd)
         bridge.attach(proc)
         bound = f"CUDA_VISIBLE_DEVICES={','.join(map(str, gpus))}"
-        where = f"日志:{ns.log}" if ns.log else "输出透传终端"
-        log.info("已启动 pid=%d → %s(%s)", proc.pid, bound, where)
+        where = f"log: {ns.log}" if ns.log else "output streams to the terminal"
+        log.info("launched pid=%d -> %s (%s)", proc.pid, bound, where)
 
         verdict = verify_claim(
             probe, proc.pid, gpus,
@@ -177,25 +187,27 @@ def _hunt_and_run(probe, cfg: HuntConfig, ns, cmd: list[str], stop: threading.Ev
         )
         if proc.poll() is not None:
             rc = _norm_rc(proc.returncode)
-            log.error("任务在确认期前自行退出 rc=%d", rc)
+            log.error("job exited on its own before the claim was confirmed, rc=%d", rc)
             close_log(fout)
             return rc
         if verdict == CLAIM_LOST:
-            log.warning("GPU %s 被其他进程抢占,回滚本次启动并继续等待", list(gpus))
+            log.warning("GPU %s was claimed by another process; rolling back this launch "
+                        "and continuing to wait", list(gpus))
             terminate_tree(proc)
             close_log(fout)
             stop.wait(backoff)
             backoff = min(backoff * 2, 60.0)
             continue
         if verdict == CLAIM_UNKNOWN:
-            log.warning("宽限期 %.0fs 内未在 GPU 上看到本进程(pid=%d);"
-                        "可能是任务尚未初始化 CUDA 或处于容器内,继续照常监控",
-                        ns.grace, proc.pid)
+            log.warning("child pid=%d was not seen on the GPU within the %.0fs grace period; "
+                        "it may not have initialized CUDA yet or may be inside a container, "
+                        "continuing to monitor as usual",
+                        proc.pid, ns.grace)
 
         t0 = time.monotonic()
         rc_raw = bridge.follow(proc, status_fn=_beat(probe, gpus),
                                heartbeat_s=ns.heartbeat)
-        log.info("任务结束 rc=%s 用时 %s",
+        log.info("job finished rc=%s after %s",
                  _norm_rc(rc_raw) if rc_raw is not None else "?", _fmt_dur(time.monotonic() - t0))
         close_log(fout)
         return _norm_rc(proc.returncode)
@@ -204,12 +216,14 @@ def _hunt_and_run(probe, cfg: HuntConfig, ns, cmd: list[str], stop: threading.Ev
 def _run_workflow(probe, wf, ns, stop: threading.Event, bridge: SignalBridge) -> int:
     from .scheduler import Scheduler, format_summary
 
-    log.info("工作流:%s | %d 个任务 | 调度:%s", wf.path, len(wf.jobs), wf.schedule)
-    log.info("节拍 %.0fs × 稳定 %d 轮;宽限期 %.0fs",
+    log.info("workflow: %s | %d job(s) | schedule: %s", wf.path, len(wf.jobs), wf.schedule)
+    log.info("tick %.0fs x %d stable rounds; grace period %.0fs",
              wf.interval_s, wf.stable_rounds, wf.grace_s)
     for j in wf.jobs:
-        need = f"{j.gpu_num} 卡" + (f" ≥{j.mem_per_gpu_mb}MB" if j.mem_per_gpu_mb else "")
-        log.info("  - %s(%s):%s", j.name, need, shlex.join(j.cmd))
+        need = f"{j.gpu_num} GPU(s)" + (
+            f" >= {j.mem_per_gpu_mb}MB" if j.mem_per_gpu_mb else ""
+        )
+        log.info("  - %s (%s): %s", j.name, need, shlex.join(j.cmd))
 
     sched = Scheduler(
         probe, wf,
@@ -226,11 +240,11 @@ def _run_workflow(probe, wf, ns, stop: threading.Event, bridge: SignalBridge) ->
 
     if interrupted or stop.is_set():
         bridge.terminate_all()
-        log.info("工作流被中止")
+        log.info("workflow aborted")
         return 130
 
     fails = sum(1 for r in results if not r.ok)
-    log.info("全部任务结束:%d 成功 / %d 失败", len(results) - fails, fails)
+    log.info("all jobs finished: %d succeeded / %d failed", len(results) - fails, fails)
     log.info("\n%s", format_summary(results))
     return min(fails, 125)
 
@@ -249,7 +263,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     has_cmd = bool(cmd_tokens)
     if ns.workflow and has_cmd:
-        parser.error("WORKFLOW 与 \"-- 命令\" 只能二选一")
+        parser.error("WORKFLOW and \"-- command\" are mutually exclusive")
 
     wf = None
     cmd: list[str] = []
@@ -264,8 +278,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         cmd = [str(t) for t in (cmd_tokens or [])]
         if not cmd:
-            parser.error('缺少待执行命令或工作流文件:'
-                         "gpu-hunter workflow.yaml 或 gpu-hunter [选项] -- python train.py")
+            parser.error('missing command or workflow file: '
+                         "gpu-hunter workflow.yaml or gpu-hunter [options] -- python train.py")
         cmd = _wrap_script(cmd)
 
     try:
@@ -297,7 +311,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return _hunt_and_run(probe, cfg, ns, cmd, stop, bridge)
     except KeyboardInterrupt:
         bridge.terminate_all()
-        log.info("收到中断,退出")
+        log.info("interrupted, exiting")
         return 130
     except Exception as e:
         from .probe import ProbeError

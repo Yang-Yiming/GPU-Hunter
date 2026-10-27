@@ -1,7 +1,8 @@
-"""轮询状态机:滑动窗口判定"稳定空闲",按优先级挑卡。
+"""Polling state machine: sliding windows decide "stably idle" and rank GPUs.
 
-AvailabilityTracker 维护每张卡的原始采样窗口;空闲谓词(严格/带显存需求)
-在读取时套用,供单任务 Hunter 与多任务 Scheduler 共用。
+AvailabilityTracker keeps the raw sample window per GPU; idle predicates
+(strict or with a memory requirement) are applied on read, so the single-job
+Hunter and the multi-job Scheduler share the same logic.
 """
 from __future__ import annotations
 
@@ -19,23 +20,23 @@ class Probe(Protocol):
 
 @dataclass
 class HuntConfig:
-    need: int = 1                        # 需要几张卡(同时空闲才算命中)
-    mem_per_gpu_mb: int | None = None    # 单卡显存需求;None 表示要求卡完全空闲
-    prefer: tuple[int, ...] = ()         # 优先顺序,如 (2, 3)
-    allow: frozenset[int] | None = None  # 只允许在这些卡里挑;None 表示全部
-    idle_mem_mb: int = 500               # 占用显存低于该值视为空闲
-    idle_util: int = 5                   # 利用率低于该值视为空闲
-    interval_s: float = 5.0              # 轮询间隔
-    stable_rounds: int = 3               # 连续多少轮空闲才认为稳定
-    max_polls: int | None = None         # 轮询上限(测试用;None 表示不限)
+    need: int = 1                        # how many GPUs must be free at the same time
+    mem_per_gpu_mb: int | None = None    # free memory needed per GPU; None means fully idle
+    prefer: tuple[int, ...] = ()         # preference order, e.g. (2, 3)
+    allow: frozenset[int] | None = None  # only pick from these GPUs; None means all
+    idle_mem_mb: int = 500               # used memory below this counts as idle
+    idle_util: int = 5                   # utilization below this counts as idle
+    interval_s: float = 5.0              # polling interval
+    stable_rounds: int = 3               # consecutive idle rounds required for stability
+    max_polls: int | None = None         # poll limit (for tests; None means unlimited)
 
     def __post_init__(self) -> None:
         if self.need < 1:
-            raise ValueError("need 必须 >= 1")
+            raise ValueError("need must be >= 1")
         if self.interval_s <= 0:
-            raise ValueError("interval_s 必须 > 0")
+            raise ValueError("interval_s must be > 0")
         if self.stable_rounds < 1:
-            raise ValueError("stable_rounds 必须 >= 1")
+            raise ValueError("stable_rounds must be >= 1")
 
 
 def passes(
@@ -45,7 +46,7 @@ def passes(
     idle_util: int,
     need_mb: int | None = None,
 ) -> bool:
-    """单个采样的空闲判定:有计算进程一律占用;再按利用率与显存条件。"""
+    """Idle predicate for one sample: compute processes always mean busy, then util and memory."""
     if info.compute_pids:
         return False
     if info.util_percent >= 0 and info.util_percent > idle_util:
@@ -65,13 +66,13 @@ def is_idle(info: GpuInfo, cfg: HuntConfig) -> bool:
 
 
 def rank_candidates(ids: Iterable[int], prefer: Sequence[int]) -> list[int]:
-    """偏好列表中的卡排前面(按给定顺序),其余按编号升序跟在后面。"""
+    """GPUs in the preference list come first (in given order), the rest by ascending id."""
     order = {g: i for i, g in enumerate(prefer)}
     return sorted(set(ids), key=lambda g: (order.get(g, len(order)), g))
 
 
 class AvailabilityTracker:
-    """按卡维护原始采样滑窗;occupied 的卡清空历史(释放后需重新稳定)。"""
+    """Keep a raw sliding window per GPU; occupied GPUs clear their history (must restabilize)."""
 
     def __init__(
         self,
@@ -108,7 +109,7 @@ class AvailabilityTracker:
             w.append(info)
 
     def stable(self, mem_per_gpu_mb: int | None = None) -> set[int]:
-        """最近 stable_rounds 轮全部满足空闲条件的卡。"""
+        """GPUs that satisfied the idle conditions in all of the last stable_rounds rounds."""
         return {
             g
             for g, w in self.windows.items()
@@ -118,7 +119,7 @@ class AvailabilityTracker:
 
 
 class Hunter:
-    """单任务守候:阻塞到凑齐稳定空闲卡为止。"""
+    """Single-job hunt: block until enough stably idle GPUs are available."""
 
     def __init__(
         self,
@@ -133,7 +134,7 @@ class Hunter:
         self.stop = stop_event if stop_event is not None else threading.Event()
 
     def hunt(self) -> list[int] | None:
-        """阻塞直到凑齐稳定空闲的卡并返回卡号;被中止/超限时返回 None。"""
+        """Block until enough stable idle GPUs are found and return their ids; None if aborted."""
         cfg = self.cfg
         tracker = AvailabilityTracker(cfg.idle_mem_mb, cfg.idle_util, cfg.stable_rounds)
         polls = 0
@@ -148,7 +149,7 @@ class Hunter:
             except Exception as e:
                 err_streak += 1
                 if err_streak == 1 or err_streak % 12 == 0:
-                    self.emit(f"警告:读取 GPU 状态失败({e}),继续重试")
+                    self.emit(f"warning: failed to read GPU state ({e}), retrying")
                 snap = {}
 
             tracker.update(snap)
@@ -157,14 +158,14 @@ class Hunter:
             if snap and not warned_refs:
                 ghost = sorted((set(cfg.prefer) | set(cfg.allow or ())) - set(snap))
                 if ghost:
-                    self.emit(f"警告:配置引用了不存在的 GPU 编号 {ghost},已忽略")
+                    self.emit(f"warning: configuration references nonexistent GPU ids {ghost}, ignored")
                 warned_refs = True
 
             stable = tracker.stable(cfg.mem_per_gpu_mb)
             ranked = rank_candidates((g for g in eligible if g in stable), cfg.prefer)
             if len(ranked) >= cfg.need:
                 chosen = ranked[: cfg.need]
-                self.emit(f"命中空闲 GPU {chosen}")
+                self.emit(f"matched idle GPU(s) {chosen}")
                 return chosen
 
             status = self._render(eligible, snap, tracker, cfg)
@@ -194,5 +195,5 @@ class Hunter:
             segs.append(
                 f"{gid}:{state}({streak},{info.mem_used_mb}MB,u{info.util_percent}%)"
             )
-        body = " ".join(segs) if segs else "(无可见 GPU)"
-        return f"等待中 | {body} | 需 {cfg.need} 张 x 连续{cfg.stable_rounds}轮"
+        body = " ".join(segs) if segs else "(no visible GPUs)"
+        return f"waiting | {body} | need {cfg.need} GPU(s) x {cfg.stable_rounds} stable rounds"

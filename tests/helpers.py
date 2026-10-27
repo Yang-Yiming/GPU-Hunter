@@ -1,4 +1,4 @@
-"""测试共享夹具:假探针、GpuInfo 构造器、HuntConfig 工厂、输出收集器。"""
+"""Shared test fixtures: fake probe, GpuInfo builder, HuntConfig factory, output collector."""
 import sys
 from pathlib import Path
 
@@ -20,7 +20,7 @@ def gpu(index, used=100, util=0, pids=(), total=81920):
 
 
 class FakeProbe:
-    """按次返回预置帧序列,超出后停在最后一帧。"""
+    """Return preset frames in order, then stay on the last frame."""
 
     def __init__(self, frames):
         self._frames = list(frames)
