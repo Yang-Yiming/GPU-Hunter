@@ -2,10 +2,11 @@
 
 Watch NVIDIA GPUs and automatically start your job as soon as enough cards are **stably idle**.
 
-Two ways to use it:
+Three ways to use it:
 
 1. **Single job**: one command plus a GPU count and preferences; run as soon as the cards are free (the classic case).
 2. **Workflow**: a YAML file defines a multi-job queue, run concurrently as slots open up (greedy), or strictly in order (sequential).
+3. **Reserve (hold)**: hold N GPUs x M memory with placeholder processes, then hand them to whatever you want later -- useful when the real task cannot be described as a command (interactive work, a GUI, a manual sequence of steps).
 
 ## Installation
 
@@ -108,6 +109,69 @@ all GPUs -> allow filter (hard) -> stable-idle check -> prefer ranking (soft) ->
 - `--allow 2,3`: only 2 and 3 are allowed; other cards stay untouched even when free.
 - Multiple GPUs are taken greedily in preference order: `--prefer 3 --gpu-num 2` with {0,2,3} idle -> {3,0}.
 
+## Reserving GPUs (hold mode)
+
+Sometimes the real job cannot be described as a command: interactive work, a
+GUI, or a manual sequence of steps. In that case gpu-hunter can *hold* the
+cards for you: it waits for N stably idle GPUs, starts one placeholder process
+per card that allocates the requested device memory, and keeps it there until
+you release it.
+
+```bash
+# hold 2 x 12G in the foreground; Ctrl-C releases
+gpu-hunter --reserve --gpu-num 2 --mem-per-gpu 12G
+
+# ... later: release and immediately run anything on the same cards
+gpu-hunter --release --run -- bash
+
+# or hold in the background and release it later
+gpu-hunter --reserve --gpu-num 2 --mem-per-gpu 12G --detach
+gpu-hunter --reserve-status
+gpu-hunter --release                     # prints CUDA_VISIBLE_DEVICES=...
+```
+
+How it behaves:
+
+- The placeholder is a CUDA driver allocation (`cuMemAlloc`) inside a small
+  resident process, so no torch/tensorflow dependency is needed. A held card
+  shows a compute process and `--mem-per-gpu` of used memory, which means other
+  gpu-hunter instances treat it as busy.
+- **Foreground (`--reserve`) is the default**: every tick verifies that each
+  placeholder is alive and still holds its memory; a lost placeholder is
+  replaced when another suitable card becomes stably idle.
+- **Ctrl-C / SIGTERM releases**: placeholders get SIGTERM, gpu-hunter waits for
+  NVML to confirm the memory is free, removes the state file and prints the
+  hand-off.
+- An **abnormal exit** (SSH drop, OOM kill, SIGKILL) does *not* release: the
+  placeholders run in their own sessions and the state file survives, so
+  `--reserve-status` still shows the reservation and `--release` recovers it.
+  Every reservation self-expires (`--hold-max`, default 12h; `0` means never).
+- `--reserve --run -- CMD` combines both: hold until Ctrl-C, then release and
+  immediately run CMD on the same cards (atomic hand-off, no race window).
+- `--reserve-full` holds all remaining free memory instead of exactly
+  `--mem-per-gpu` -- stronger isolation, but it wastes the rest of the card.
+- With `--detach` the command exits after acquiring; supervision is then
+  limited to `--reserve-status` plus the self-expiry.
+- Reservation state lives in `$XDG_STATE_HOME/gpu-hunter/reservation-<uid>.json`
+  (mode 0600). `--release --force` clears stale or unreadable state (after a
+  reboot, a hostname change, or if a placeholder pid was reused) and never
+  signals a process it cannot verify.
+
+Notes:
+
+- A reservation holds memory and a compute process; it is **not** an exclusive
+  GPU lock. A job that still fits in the remaining memory can be started by
+  someone who ignores GPU processes.
+- Container/MIG setups where the driver API cannot allocate: pass `--hold-cmd`
+  with your own placeholder command; `{mem_mb}`, `{gpu}` and `{timeout}` are
+  substituted. The same hook is what the test-suite uses to simulate holders.
+- A plain `--release` prints `export CUDA_VISIBLE_DEVICES=...`, but the window
+  between releasing and your command actually allocating has a small race
+  window; prefer `--release --run` for a real hand-off.
+
+Reserve options: `--reserve`, `--detach`, `--hold-max SEC`, `--reserve-full`,
+`--hold-cmd CMD`, `--reserve-status`, `--release`, `--run`, `--force`.
+
 ## How it works
 
 1. **Probing**: uses NVML (the library behind `nvidia-smi`) and never parses text output. A card whose process list cannot be read is treated as busy, not idle.
@@ -116,6 +180,7 @@ all GPUs -> allow filter (hard) -> stable-idle check -> prefer ranking (soft) ->
 4. **Claim verification**: checks compute processes on the target GPUs during the grace period. Ownership is decided by session id, so bash wrappers, `torchrun` workers and other descendants of the launched child count as ours; a process that is verifiably another session and persists for `claim-stable` seconds triggers a rollback and requeue. Pids that cannot be attributed (containers/namespaces) downgrade to a warning and continue, and are never a reason to kill our job. Early child exit ends verification immediately.
 5. **Safety gate**: every signal is sent only after `/proc/<pid>` confirms that the target (and every member of its process group) belongs to the current user and that the pid still refers to the process we launched (pid-reuse check). If ownership or identity cannot be verified, the signal is refused. SIGINT/SIGTERM are forwarded to every child process group; two presses within 5 seconds escalate to SIGKILL; Ctrl-C also stops scheduling new workflow jobs.
 6. **Single-instance lock**: flock ensures only one hunter runs per machine.
+7. **Reservation**: hold mode records placeholder pids and kernel start times in a small state file and reuses the same ownership/pid-reuse safety gate for every later signal. Placeholders are started in their own sessions and are not tied to the hunter's signal bridge, so an abnormal hunter exit leaves the reservation recoverable instead of silently leaking or losing the cards.
 
 Note: the exit of the direct child marks a job as finished. Do not background the real workload inside `cmd` (for example `bash -c 'python train.py &'`); start it in the foreground so GPU accounting and signals stay correct.
 
