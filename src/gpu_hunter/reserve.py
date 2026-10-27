@@ -780,10 +780,21 @@ class Supervisor:
                     signal_group_checked(rec.pid, rec.start_time, signal.SIGTERM)
             state.gpus = [rec for rec in state.gpus if rec not in lost]
             self.emit(f"trying to re-acquire {len(lost)} GPU(s) to restore the reservation")
+            replace_opts = replace(
+                self.opts, need=len(lost),
+                mem_mb=self.opts.mem_mb, full=self.opts.full,
+            )
+            if state.expires_at is not None:
+                # Replacement placeholders must never outlive the reservation:
+                # if this supervisor dies abnormally their own timeout is the
+                # only thing left to release them.
+                replace_opts = replace(
+                    replace_opts,
+                    hold_max_s=max(1.0, state.expires_at - self._now()),
+                )
             try:
                 extra = _acquire_once(
-                    self.probe, replace(self.opts, need=len(lost),
-                                        mem_mb=self.opts.mem_mb, full=self.opts.full),
+                    self.probe, replace_opts,
                     emit=self.emit, stop=self.stop, on_attempt=self.on_attempt,
                 )
             except ReserveError as e:
