@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gpu-hunter"
-version = "0.3.0"
-description = "Poll GPUs with NVML and auto-launch a job once the requested cards are stably free"
+version = "0.4.0"
+description = "Poll GPUs with NVML, auto-launch a job once the requested cards are stably free, or hold cards for later use"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 dependencies = ["nvidia-ml-py>=12", "PyYAML>=5.4"]
