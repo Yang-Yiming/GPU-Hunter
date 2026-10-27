@@ -45,7 +45,9 @@ def wf(jobs, schedule="greedy", **kw):
         interval_s=0.005,
         stable_rounds=1,
         grace_s=0.01,
+        claim_stable_s=0.01,
         heartbeat_s=3600.0,
+        retry_delay_s=0.0,
     )
     base.update(kw)
     return WorkflowSpec(jobs=list(jobs), **base)
@@ -72,7 +74,7 @@ class LaunchRecorder:
 
 
 def run_scheduler(probe, workflow, recorder, verify=lambda proc, gpus: CLAIM_CONFIRMED,
-                  stop_event=None, max_ticks=50):
+                  stop_event=None, max_ticks=50, notify=None):
     with patch.object(sched_mod, "launch", recorder), \
          patch.object(sched_mod, "terminate_tree") as term:
         s = Scheduler(
@@ -81,6 +83,7 @@ def run_scheduler(probe, workflow, recorder, verify=lambda proc, gpus: CLAIM_CON
             verify_fn=verify,
             max_ticks=max_ticks,
             stop_event=stop_event,
+            notify=notify,
         )
         results = s.run()
         return s, results, term
@@ -174,6 +177,47 @@ class FailureTest(unittest.TestCase):
         self.assertEqual(by_name["bad"].rc, 3)
         self.assertTrue(by_name["good"].ok)
 
+    def test_launch_oserror_recorded_and_queue_continues(self):
+        with patch.object(
+            sched_mod,
+            "launch",
+            side_effect=[OSError("no such executable"), (FakeProc(rc_immediate=0), None)],
+        ), patch.object(sched_mod, "terminate_tree"):
+            s = Scheduler(
+                FakeProbe(FREE2 * 5),
+                wf([job("bad"), job("good")]),
+                emit=lambda m: None,
+                verify_fn=lambda proc, gpus: CLAIM_CONFIRMED,
+                max_ticks=10,
+            )
+            results = s.run()
+        by_name = {r.name: r for r in results}
+        self.assertEqual(by_name["bad"].rc, 127)
+        self.assertTrue(by_name["good"].ok)
+
+
+class SnapshotErrorTest(unittest.TestCase):
+    def test_failed_snapshot_does_not_reset_stability(self):
+        class FlakyProbe:
+            def __init__(self):
+                self.calls = 0
+
+            def snapshot(self):
+                self.calls += 1
+                if self.calls == 2:
+                    raise RuntimeError("nvml hiccup")
+                return {0: gpu(0)}
+
+        rec = LaunchRecorder([FakeProc(rc_immediate=0)])
+        _, results, _ = run_scheduler(
+            FlakyProbe(),
+            wf([job("a")], stable_rounds=2),
+            rec,
+            max_ticks=3,
+        )
+        self.assertEqual(len(rec.calls), 1)
+        self.assertEqual(results[0].rc, 0)
+
 
 class PreemptTest(unittest.TestCase):
     def test_lost_rolls_back_and_retries(self):
@@ -190,8 +234,8 @@ class PreemptTest(unittest.TestCase):
         self.assertEqual(s.pending, [])                    # second attempt left the queue on success
 
     def test_rollback_releases_claim_for_next_job(self):
-        # big is preempted and releases the GPU; the same tick keeps scanning -> small flies
-        # immediately; once small finishes, big retries successfully
+        # big is preempted and its GPU history is invalidated; the same GPU must
+        # restabilize before another job may use it
         seq = iter([CLAIM_LOST, CLAIM_CONFIRMED, CLAIM_CONFIRMED])
         rec = LaunchRecorder(
             [FakeProc(), FakeProc(rc_immediate=0), FakeProc(done_after_polls=2)]
@@ -213,6 +257,20 @@ class PreemptTest(unittest.TestCase):
         self.assertEqual(by_name["big"].attempts, 2)
         self.assertTrue(by_name["big"].ok)
 
+    def test_retry_gives_up_after_max_attempts(self):
+        rec = LaunchRecorder([FakeProc() for _ in range(5)])
+        _, results, term = run_scheduler(
+            FakeProbe(FREE1 * 20),
+            wf([job("a")], max_attempts=2),
+            rec,
+            verify=lambda proc, gpus: CLAIM_LOST,
+        )
+        self.assertEqual(len(rec.calls), 2)
+        self.assertEqual(len(results), 1)
+        self.assertIsNone(results[0].rc)
+        self.assertEqual(results[0].attempts, 2)
+        self.assertEqual(term.call_count, 2)
+
 
 class StopTest(unittest.TestCase):
     def test_stop_aborts_and_kills_children(self):
@@ -229,6 +287,39 @@ class StopTest(unittest.TestCase):
         self.assertEqual(len(results), 1)                 # one aborted result recorded
         self.assertIsNone(results[0].rc)
 
+    def test_stop_prevents_next_job_from_starting(self):
+        import threading
+
+        stop = threading.Event()
+        rec = LaunchRecorder([FakeProc()])
+        rec.on_launch = stop.set
+        _, results, _ = run_scheduler(
+            FakeProbe(FREE1 * 10),
+            wf([job("a"), job("b")]),
+            rec,
+            stop_event=stop,
+            max_ticks=10,
+        )
+        self.assertEqual(len(rec.calls), 1)
+        self.assertEqual([r.name for r in results], ["a"])
+
+    def test_stop_while_running_records_aborted_job(self):
+        import threading
+
+        stop = threading.Event()
+        rec = LaunchRecorder([FakeProc()])                # running job that never exits
+
+        def stop_later():
+            threading.Timer(0.05, stop.set).start()
+
+        rec.on_launch = stop_later
+        _, results, term = run_scheduler(
+            FakeProbe(FREE1 * 20), wf([job("long")]), rec, stop_event=stop, max_ticks=200
+        )
+        self.assertEqual(len(results), 1)
+        self.assertIsNone(results[0].rc)
+        term.assert_called_once()
+
 
 class SummaryTest(unittest.TestCase):
     def test_format_summary_layout(self):
@@ -244,6 +335,46 @@ class SummaryTest(unittest.TestCase):
         self.assertIn("FAIL", lines[3])
         self.assertIn("2,3", lines[2])
         self.assertEqual(format_summary([]), "(no jobs recorded)")
+
+
+class NotifyTest(unittest.TestCase):
+    def events(self):
+        return []
+
+    def test_launch_and_finish_are_reported(self):
+        events = []
+        rec = LaunchRecorder([FakeProc(done_after_polls=2)])
+        run_scheduler(
+            FakeProbe(FREE1 * 5), wf([job("a")]), rec,
+            notify=lambda kind, msg: events.append((kind, msg)),
+        )
+        kinds = [kind for kind, _ in events]
+        self.assertIn("launch", kinds)
+        self.assertIn("finish", kinds)
+        self.assertNotIn("attempt", kinds)
+
+    def test_waiting_tick_emits_attempt_x(self):
+        events = []
+        rec = LaunchRecorder([])
+        run_scheduler(
+            FakeProbe([{0: gpu(0, used=90000)}] * 5), wf([job("a")]), rec,
+            notify=lambda kind, msg: events.append((kind, msg)),
+            max_ticks=3,
+        )
+        self.assertEqual(events, [("attempt", "")] * 3)
+
+    def test_preemption_emits_retry(self):
+        events = []
+        seq = iter([CLAIM_LOST, CLAIM_CONFIRMED])
+        rec = LaunchRecorder([FakeProc(), FakeProc(done_after_polls=2)])
+        run_scheduler(
+            FakeProbe(FREE1 * 8), wf([job("a")]), rec,
+            verify=lambda proc, gpus: next(seq),
+            notify=lambda kind, msg: events.append((kind, msg)),
+        )
+        kinds = [kind for kind, _ in events]
+        self.assertEqual(kinds[0], "retry")
+        self.assertIn("launch", kinds)
 
 
 if __name__ == "__main__":
