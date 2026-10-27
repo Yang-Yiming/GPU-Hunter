@@ -124,6 +124,43 @@ def _proc_start_time(pid: int) -> int | None:
     return int(fields[19])
 
 
+def _proc_state(pid: int) -> str | None:
+    """One-letter process state from /proc/<pid>/stat ('R', 'S', 'Z', ...)."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    rparen = data.rfind(b")")
+    if rparen < 0:
+        return None
+    fields = data[rparen + 2 :].split()
+    if not fields:
+        return None
+    return fields[0].decode("ascii", "replace")
+
+
+def process_start_time(pid: int) -> int | None:
+    """Public wrapper around the kernel start time used for pid-reuse checks."""
+    return _proc_start_time(pid)
+
+
+def process_is_live(pid: int, expected_start: int | None) -> bool:
+    """True only when *pid* is a non-zombie process we own and still recorded.
+
+    Used by reservation management, where the placeholder is not a live child
+    of the current interpreter (it may have been started by an earlier
+    invocation).  Requires an explicit recorded start time: without one the
+    process cannot be told apart from a reused pid.
+    """
+    if expected_start is None or not is_owned_by_current_user(pid):
+        return False
+    if _proc_start_time(pid) != expected_start:
+        return False
+    state = _proc_state(pid)
+    return state is not None and state != "Z"
+
+
 def _group_members(pgid: int) -> list[tuple[int, int | None]] | None:
     """Return (pid, uid) pairs in process group ``pgid``; None if /proc is unreadable."""
     try:
@@ -171,22 +208,29 @@ def _group_alive(pgid: int) -> bool:
     return bool(members)
 
 
-def _send_group(proc: subprocess.Popen, sig: signal.Signals) -> bool:
-    """Signal the child's process group only when every member belongs to us.
+def signal_group_checked(
+    pid: int,
+    expected_start: int | None,
+    sig: signal.Signals,
+    *,
+    require_identity: bool = True,
+) -> bool:
+    """Send *sig* to the process group of *pid* only after verifying ownership.
+
+    This is the single safety gate for every signal gpu-hunter sends, including
+    placeholders recorded in a reservation state file by an earlier invocation
+    (those are not live child objects of the current interpreter).
 
     Returns True when a signal was delivered (or attempted against a live
-    child), False when the process/group could not be verified as ours.
+    process), False when the process/group could not be verified as ours.
     """
-    pid = proc.pid
-    recorded = hasattr(proc, "_gpu_hunter_start_time")
-    expected_start = getattr(proc, "_gpu_hunter_start_time", None)
-    actual_start = _proc_start_time(pid)
-    if recorded:
+    if require_identity:
         if expected_start is None:
             log.warning(
                 "refusing to signal pid=%d: process identity was not recorded at launch", pid
             )
             return False
+        actual_start = _proc_start_time(pid)
         if actual_start is not None and actual_start != expected_start:
             log.warning(
                 "refusing to signal pid=%d: process identity changed (pid reuse?)", pid
@@ -202,7 +246,7 @@ def _send_group(proc: subprocess.Popen, sig: signal.Signals) -> bool:
     if pgid <= 0 or pgid == os.getpgrp():
         if is_owned_by_current_user(pid):
             try:
-                proc.send_signal(sig)
+                os.kill(pid, sig)
                 return True
             except OSError:
                 return False
@@ -224,11 +268,22 @@ def _send_group(proc: subprocess.Popen, sig: signal.Signals) -> bool:
     except (ProcessLookupError, PermissionError):
         if is_owned_by_current_user(pid):
             try:
-                proc.send_signal(sig)
+                os.kill(pid, sig)
                 return True
             except OSError:
                 pass
         return False
+
+
+def _send_group(proc: subprocess.Popen, sig: signal.Signals) -> bool:
+    """Signal the child's process group only when every member belongs to us."""
+    recorded = hasattr(proc, "_gpu_hunter_start_time")
+    expected_start = getattr(proc, "_gpu_hunter_start_time", None)
+    # Processes launched by launch() carry their identity; others (e.g. a
+    # Popen created by a caller/test) keep the historical, uid-only check.
+    return signal_group_checked(
+        proc.pid, expected_start, sig, require_identity=recorded
+    )
 
 
 def terminate_tree(proc: subprocess.Popen, term_wait: float = 10.0) -> None:
