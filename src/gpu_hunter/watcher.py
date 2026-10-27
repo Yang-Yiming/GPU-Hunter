@@ -150,17 +150,23 @@ class Hunter:
         emit: Callable[[str], None] | None = None,
         stop_event: threading.Event | None = None,
         on_attempt: Callable[[bool, str], None] | None = None,
+        tracker: AvailabilityTracker | None = None,
     ) -> None:
         self.probe = probe
         self.cfg = cfg
         self.emit = emit if emit is not None else print
         self.stop = stop_event if stop_event is not None else threading.Event()
         self.on_attempt = on_attempt
+        # An explicit tracker lets callers hunt repeatedly without losing the
+        # stability history between calls (used by eager, partial reservation).
+        self.tracker = tracker
 
     def hunt(self) -> list[int] | None:
         """Block until enough stable idle GPUs are found and return their ids; None if aborted."""
         cfg = self.cfg
-        tracker = AvailabilityTracker(cfg.idle_mem_mb, cfg.idle_util, cfg.stable_rounds)
+        tracker = self.tracker
+        if tracker is None:
+            tracker = AvailabilityTracker(cfg.idle_mem_mb, cfg.idle_util, cfg.stable_rounds)
         polls = 0
         last_status = ""
         err_streak = 0

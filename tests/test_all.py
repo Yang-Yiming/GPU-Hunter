@@ -212,6 +212,27 @@ class HunterTest(unittest.TestCase):
         self.assertIsNone(out)
         self.assertEqual(probe.calls, 0)
 
+    def test_shared_tracker_keeps_history_between_hunts(self):
+        # Eager reservations hunt one card at a time; a shared tracker must not
+        # throw away the stability history of the remaining cards.
+        from gpu_hunter.watcher import AvailabilityTracker
+
+        frames = [
+            {0: gpu(0), 1: gpu(1, used=90000)},
+            {0: gpu(0), 1: gpu(1)},
+            {0: gpu(0, used=90000), 1: gpu(1)},
+        ]
+        probe = FakeProbe(frames)
+        hunter = Hunter(
+            probe, cfg(need=1, stable_rounds=2), emit=Collector(),
+            tracker=AvailabilityTracker(stable_rounds=2),
+        )
+        self.assertEqual(hunter.hunt(), [0])
+        self.assertEqual(probe.calls, 2)
+        # GPU1 already has two fresh samples in the shared window.
+        self.assertEqual(hunter.hunt(), [1])
+        self.assertEqual(probe.calls, 3)
+
 
 class VerifyClaimTest(unittest.TestCase):
     def setUp(self):
