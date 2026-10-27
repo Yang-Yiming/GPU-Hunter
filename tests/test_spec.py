@@ -62,7 +62,7 @@ class WorkflowSpecTest(unittest.TestCase):
                 cmd: y.py
                 gpu-num: 4
                 env: {BAR: b, FOO: override}
-                allow: [7]
+                allow: [7, 8, 9, 10]
             """
         )
         a, b = wf.jobs
@@ -72,7 +72,7 @@ class WorkflowSpecTest(unittest.TestCase):
         self.assertEqual(a.env, {"FOO": "a"})
         self.assertEqual(b.gpu_num, 4)
         self.assertEqual(b.env, {"FOO": "override", "BAR": "b"})
-        self.assertEqual(b.allow, frozenset({7}))
+        self.assertEqual(b.allow, frozenset({7, 8, 9, 10}))
         self.assertEqual(b.cmd, [sys.executable, "y.py"])
 
     def test_cmd_as_list_and_dash_log_passthrough(self):
@@ -94,8 +94,12 @@ class WorkflowSpecTest(unittest.TestCase):
             interval: 2.5
             stable-rounds: 5
             idle-mem: 300M
+            idle-util: 7
             grace: 10
+            claim-stable: 3
             heartbeat: 30
+            max-attempts: 4
+            retry-delay: 1.5
             jobs:
               - {name: a, cmd: sleep.sh}
             """
@@ -104,7 +108,23 @@ class WorkflowSpecTest(unittest.TestCase):
         self.assertAlmostEqual(wf.interval_s, 2.5)
         self.assertEqual(wf.stable_rounds, 5)
         self.assertEqual(wf.idle_mem_mb, 300)
+        self.assertEqual(wf.idle_util, 7)
         self.assertAlmostEqual(wf.grace_s, 10.0)
+        self.assertAlmostEqual(wf.claim_stable_s, 3.0)
+        self.assertEqual(wf.max_attempts, 4)
+        self.assertAlmostEqual(wf.retry_delay_s, 1.5)
+
+    def test_allow_smaller_than_gpu_num_rejected(self):
+        with self.assertRaisesRegex(SpecError, "only 1 GPU"):
+            self.load("jobs: [{cmd: x, gpu-num: 2, allow: [7]}]\n")
+
+    def test_zero_idle_mem_rejected(self):
+        with self.assertRaisesRegex(SpecError, "idle-mem"):
+            self.load("idle-mem: 0\njobs: [{cmd: x}]\n")
+
+    def test_max_attempts_must_be_positive(self):
+        with self.assertRaisesRegex(SpecError, "max-attempts"):
+            self.load("max-attempts: 0\njobs: [{cmd: x}]\n")
 
     def test_duplicate_names_rejected(self):
         with self.assertRaisesRegex(SpecError, "duplicate name"):

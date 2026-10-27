@@ -1,15 +1,10 @@
 """Load and validate workflow YAML: WorkflowSpec / JobSpec."""
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import yaml
-
 from .parsing import coerce_cmd, coerce_path, ensure_interpreter, parse_int_list, parse_size_mb
-
-log = logging.getLogger("gpu-hunter")
 
 
 class SpecError(ValueError):
@@ -43,8 +38,12 @@ class WorkflowSpec:
     interval_s: float = 5.0
     stable_rounds: int = 3
     idle_mem_mb: int = 500
+    idle_util: int = 5
     grace_s: float = 45.0
+    claim_stable_s: float = 8.0        # how long a foreign pid must persist to call it preemption
     heartbeat_s: float = 120.0
+    max_attempts: int = 3              # per job; preempted jobs are retried at most this often
+    retry_delay_s: float = 2.0         # base delay between preemption retries (doubles each time)
     jobs: list[JobSpec] = field(default_factory=list)
 
 
@@ -79,23 +78,29 @@ def _opt_float(value, ctx: str, default: float, *, minimum: float) -> float:
     return v
 
 
-def _opt_size(value, ctx: str) -> int | None:
+def _opt_size(value, ctx: str, *, minimum: int = 1) -> int | None:
     if value is None:
         return None
-    try:
-        return parse_size_mb(value) if isinstance(value, str) else _opt_int(value, ctx, minimum=1)
-    except ValueError as e:
-        raise _err(ctx, str(e)) from None
+    if isinstance(value, str):
+        try:
+            size = parse_size_mb(value)
+        except ValueError as e:
+            raise _err(ctx, str(e)) from None
+    else:
+        size = _opt_int(value, ctx, minimum=minimum)
+    if size is not None and size < minimum:
+        raise _err(ctx, f"must be >= {minimum}")
+    return size
 
 
-def _opt_ids(value, ctx: str):
+def _opt_ids(value, ctx: str, *, as_set: bool):
     if value is None:
         return None
     try:
         ids = parse_int_list(value)
     except ValueError as e:
         raise _err(ctx, str(e)) from None
-    return tuple(ids) if ctx.endswith("prefer") else frozenset(ids)
+    return frozenset(ids) if as_set else tuple(ids)
 
 
 def _opt_env(value, ctx: str) -> dict[str, str]:
@@ -105,7 +110,7 @@ def _opt_env(value, ctx: str) -> dict[str, str]:
         raise _err(ctx, "env must be a mapping from strings to strings")
     out = {}
     for k, v in value.items():
-        if isinstance(v, (dict, list)):
+        if v is None or isinstance(v, (dict, list)):
             raise _err(f"{ctx}.env[{k}]", "value must be a scalar")
         out[str(k)] = str(v)
     return out
@@ -122,7 +127,7 @@ def _build_job(raw, index: int, defaults: dict) -> JobSpec:
     if name is not None and (not isinstance(name, str) or not name.strip()):
         raise _err(f"{ctx}.name", "must be a non-empty string")
 
-    cmd_value = raw.get("cmd", defaults.get("cmd"))
+    cmd_value = raw.get("cmd")
     if cmd_value is None:
         raise _err(ctx, "missing required field cmd")
     try:
@@ -134,8 +139,14 @@ def _build_job(raw, index: int, defaults: dict) -> JobSpec:
         raw.get("gpu-num", defaults.get("gpu-num")), f"{ctx}.gpu-num", 1, minimum=1
     )
     mem = _opt_size(raw.get("mem-per-gpu", defaults.get("mem-per-gpu")), f"{ctx}.mem-per-gpu")
-    prefer = _opt_ids(raw.get("prefer", defaults.get("prefer")), f"{ctx}.prefer") or ()
-    allow = _opt_ids(raw.get("allow", defaults.get("allow")), f"{ctx}.allow")
+    prefer = _opt_ids(raw.get("prefer", defaults.get("prefer")), f"{ctx}.prefer", as_set=False) or ()
+    allow = _opt_ids(raw.get("allow", defaults.get("allow")), f"{ctx}.allow", as_set=True)
+
+    if allow is not None and len(allow) < gpu_num:
+        raise _err(
+            f"{ctx}.allow",
+            f"only {len(allow)} GPU(s) allowed but gpu-num is {gpu_num}",
+        )
 
     env = _opt_env(defaults.get("env"), "defaults.env")
     env.update(_opt_env(raw.get("env"), f"{ctx}.env"))
@@ -171,14 +182,20 @@ def load_workflow(path: str | Path) -> WorkflowSpec:
     if not path.is_file():
         raise SpecError(f"workflow file does not exist: {path}")
     try:
+        import yaml
+    except ImportError:
+        raise SpecError(
+            "PyYAML is required for workflow mode: pip install PyYAML"
+        ) from None
+    try:
         doc = yaml.safe_load(path.read_text(encoding="utf-8"))
     except yaml.YAMLError as e:
         raise SpecError(f"YAML syntax error ({path}): {e}") from None
     root = _expect_mapping(doc, str(path))
 
     unknown = set(root) - {
-        "schedule", "interval", "stable-rounds", "idle-mem", "grace",
-        "heartbeat", "defaults", "jobs",
+        "schedule", "interval", "stable-rounds", "idle-mem", "idle-util", "grace",
+        "claim-stable", "heartbeat", "max-attempts", "retry-delay", "defaults", "jobs",
     }
     if unknown:
         raise _err(str(path), f"unknown top-level fields {sorted(unknown)}")
@@ -197,14 +214,19 @@ def load_workflow(path: str | Path) -> WorkflowSpec:
     if unknown_d:
         raise _err("defaults", f"unknown fields {sorted(unknown_d)}, allowed: {sorted(_DEFAULT_KEYS)}")
 
+    idle_mem = _opt_size(root.get("idle-mem"), "idle-mem")
     wf = WorkflowSpec(
         path=path,
         schedule=schedule,
         interval_s=_opt_float(root.get("interval"), "interval", 5.0, minimum=0.1),
         stable_rounds=_opt_int(root.get("stable-rounds"), "stable-rounds", 3, minimum=1),
-        idle_mem_mb=_opt_size(root.get("idle-mem"), "idle-mem") or 500,
+        idle_mem_mb=idle_mem if idle_mem is not None else 500,
+        idle_util=_opt_int(root.get("idle-util"), "idle-util", 5, minimum=0),
         grace_s=_opt_float(root.get("grace"), "grace", 45.0, minimum=0.0),
+        claim_stable_s=_opt_float(root.get("claim-stable"), "claim-stable", 8.0, minimum=0.0),
         heartbeat_s=_opt_float(root.get("heartbeat"), "heartbeat", 120.0, minimum=1.0),
+        max_attempts=_opt_int(root.get("max-attempts"), "max-attempts", 3, minimum=1),
+        retry_delay_s=_opt_float(root.get("retry-delay"), "retry-delay", 2.0, minimum=0.0),
     )
     wf.jobs = [_build_job(j, i, defaults_raw) for i, j in enumerate(jobs_raw)]
 

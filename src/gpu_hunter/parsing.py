@@ -60,9 +60,10 @@ def ensure_interpreter(cmd: list[str]) -> list[str]:
     """Add an interpreter for a lone xx.py/xx.sh; return anything else unchanged."""
     if len(cmd) == 1:
         s = cmd[0]
-        if s.endswith(".py"):
+        lower = s.lower()
+        if lower.endswith(".py"):
             return [sys.executable, s]
-        if s.endswith(".sh"):
+        if lower.endswith(".sh"):
             return ["bash", s]
     return cmd
 
@@ -83,4 +84,4 @@ def coerce_cmd(value, ctx: str) -> list[str]:
 def coerce_path(value, ctx: str) -> Path:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{ctx}: path must be a non-empty string")
-    return Path(value)
+    return Path(value).expanduser()
