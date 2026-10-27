@@ -1,16 +1,24 @@
 """GPU state probing: talks to NVML directly (the library behind nvidia-smi), no text parsing."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
+from typing import Protocol
 
 try:
     import pynvml
 except Exception:
     pynvml = None
 
+log = logging.getLogger("gpu-hunter")
+
 
 class ProbeError(RuntimeError):
     pass
+
+
+class Probe(Protocol):
+    def snapshot(self) -> dict[int, "GpuInfo"]: ...
 
 
 @dataclass(frozen=True)
@@ -20,7 +28,9 @@ class GpuInfo:
     mem_used_mb: int
     mem_total_mb: int
     util_percent: int
-    compute_pids: tuple[int, ...]
+    # None means the process list could not be read; treat as "unknown/busy",
+    # never as "no processes" (that would risk launching onto an occupied GPU).
+    compute_pids: tuple[int, ...] | None
 
     @property
     def mem_free_mb(self) -> int:
@@ -28,7 +38,10 @@ class GpuInfo:
 
 
 def describe(info: GpuInfo) -> str:
-    pids = ",".join(str(p) for p in info.compute_pids) or "-"
+    if info.compute_pids is None:
+        pids = "?"
+    else:
+        pids = ",".join(str(p) for p in info.compute_pids) or "-"
     return (
         f"GPU{info.index}[{info.name}] "
         f"{info.mem_used_mb}/{info.mem_total_mb}MB util={info.util_percent}% pids={pids}"
@@ -43,7 +56,7 @@ def _name_of(handle) -> str:
     return n.decode() if isinstance(n, bytes) else str(n)
 
 
-def _compute_pids(handle) -> tuple[int, ...]:
+def _compute_pids(handle) -> tuple[int, ...] | None:
     for attr in (
         "nvmlDeviceGetComputeRunningProcesses_v3",
         "nvmlDeviceGetComputeRunningProcesses_v2",
@@ -56,7 +69,10 @@ def _compute_pids(handle) -> tuple[int, ...]:
             return tuple(int(p.pid) for p in fn(handle))
         except pynvml.NVMLError:
             continue
-    return ()
+        except Exception:
+            # A broken/old binding must not look like an idle card.
+            continue
+    return None
 
 
 class NVMLProbe:
@@ -79,9 +95,11 @@ class NVMLProbe:
             self.close()
             raise ProbeError(f"failed to enumerate GPUs: {e}") from e
         self._names = [_name_of(h) for h in self._handles]
+        self._warned: set[int] = set()
 
     def snapshot(self) -> dict[int, GpuInfo]:
         out: dict[int, GpuInfo] = {}
+        errors = 0
         for i, h in enumerate(self._handles):
             try:
                 mem = pynvml.nvmlDeviceGetMemoryInfo(h)
@@ -91,7 +109,12 @@ class NVMLProbe:
                 except pynvml.NVMLError:
                     util = -1
             except pynvml.NVMLError as e:
-                raise ProbeError(f"failed to read state of GPU{i}: {e}") from e
+                # Skip just this card instead of invalidating the whole machine.
+                errors += 1
+                if i not in self._warned:
+                    self._warned.add(i)
+                    log.warning("failed to read state of GPU%d: %s; skipping it", i, e)
+                continue
             out[i] = GpuInfo(
                 index=i,
                 name=self._names[i],
@@ -100,6 +123,8 @@ class NVMLProbe:
                 util_percent=util,
                 compute_pids=_compute_pids(h),
             )
+        if errors and not out:
+            raise ProbeError("failed to read state of every GPU")
         return out
 
     def close(self) -> None:

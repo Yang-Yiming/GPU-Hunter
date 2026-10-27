@@ -9,13 +9,19 @@ from __future__ import annotations
 import threading
 from collections import deque
 from dataclasses import dataclass
-from typing import Callable, Iterable, Protocol, Sequence
+from typing import Callable, Iterable, Sequence
 
-from .probe import GpuInfo
+from .probe import GpuInfo, Probe
 
-
-class Probe(Protocol):
-    def snapshot(self) -> dict[int, GpuInfo]: ...
+__all__ = [
+    "AvailabilityTracker",
+    "HuntConfig",
+    "Hunter",
+    "Probe",
+    "is_idle",
+    "passes",
+    "rank_candidates",
+]
 
 
 @dataclass
@@ -37,6 +43,14 @@ class HuntConfig:
             raise ValueError("interval_s must be > 0")
         if self.stable_rounds < 1:
             raise ValueError("stable_rounds must be >= 1")
+        if self.idle_mem_mb < 0:
+            raise ValueError("idle_mem_mb must be >= 0")
+        if self.idle_util < 0:
+            raise ValueError("idle_util must be >= 0")
+        if self.allow is not None and len(self.allow) < self.need:
+            raise ValueError(
+                f"allow list has {len(self.allow)} GPU(s) but {self.need} are required"
+            )
 
 
 def passes(
@@ -47,7 +61,8 @@ def passes(
     need_mb: int | None = None,
 ) -> bool:
     """Idle predicate for one sample: compute processes always mean busy, then util and memory."""
-    if info.compute_pids:
+    # An unreadable process list is unknown, not empty: fail closed.
+    if info.compute_pids is None or info.compute_pids:
         return False
     if info.util_percent >= 0 and info.util_percent > idle_util:
         return False
@@ -80,6 +95,8 @@ class AvailabilityTracker:
         idle_util: int = 5,
         stable_rounds: int = 3,
     ) -> None:
+        if stable_rounds < 1:
+            raise ValueError("stable_rounds must be >= 1")
         self.idle_mem_mb = idle_mem_mb
         self.idle_util = idle_util
         self.stable_rounds = stable_rounds
@@ -108,6 +125,11 @@ class AvailabilityTracker:
             w = self.windows.setdefault(gid, deque(maxlen=self.stable_rounds))
             w.append(info)
 
+    def invalidate(self, gpus: Iterable[int]) -> None:
+        """Drop history for GPUs whose state is no longer trustworthy (e.g. a lost claim)."""
+        for g in gpus:
+            self.windows.pop(g, None)
+
     def stable(self, mem_per_gpu_mb: int | None = None) -> set[int]:
         """GPUs that satisfied the idle conditions in all of the last stable_rounds rounds."""
         return {
@@ -127,11 +149,13 @@ class Hunter:
         cfg: HuntConfig,
         emit: Callable[[str], None] | None = None,
         stop_event: threading.Event | None = None,
+        on_attempt: Callable[[bool, str], None] | None = None,
     ) -> None:
         self.probe = probe
         self.cfg = cfg
         self.emit = emit if emit is not None else print
         self.stop = stop_event if stop_event is not None else threading.Event()
+        self.on_attempt = on_attempt
 
     def hunt(self) -> list[int] | None:
         """Block until enough stable idle GPUs are found and return their ids; None if aborted."""
@@ -150,7 +174,15 @@ class Hunter:
                 err_streak += 1
                 if err_streak == 1 or err_streak % 12 == 0:
                     self.emit(f"warning: failed to read GPU state ({e}), retrying")
-                snap = {}
+                if self.on_attempt is not None:
+                    self.on_attempt(False, "")
+                # Do not feed an empty snapshot into the tracker: a transient
+                # NVML error must not reset every GPU's stability window.
+                polls += 1
+                if cfg.max_polls is not None and polls >= cfg.max_polls:
+                    return None
+                self.stop.wait(cfg.interval_s)
+                continue
 
             tracker.update(snap)
             eligible = [g for g in sorted(snap) if cfg.allow is None or g in cfg.allow]
@@ -165,13 +197,19 @@ class Hunter:
             ranked = rank_candidates((g for g in eligible if g in stable), cfg.prefer)
             if len(ranked) >= cfg.need:
                 chosen = ranked[: cfg.need]
-                self.emit(f"matched idle GPU(s) {chosen}")
+                message = f"matched idle GPU(s) {chosen}"
+                self.emit(message)
+                if self.on_attempt is not None:
+                    self.on_attempt(True, message)
                 return chosen
 
             status = self._render(eligible, snap, tracker, cfg)
             if status != last_status:
                 self.emit(status)
                 last_status = status
+
+            if self.on_attempt is not None:
+                self.on_attempt(False, "")
 
             polls += 1
             if cfg.max_polls is not None and polls >= cfg.max_polls:

@@ -15,7 +15,7 @@ def gpu(index, used=100, util=0, pids=(), total=81920):
         mem_used_mb=used,
         mem_total_mb=total,
         util_percent=util,
-        compute_pids=tuple(pids),
+        compute_pids=tuple(pids) if pids is not None else None,
     )
 
 
