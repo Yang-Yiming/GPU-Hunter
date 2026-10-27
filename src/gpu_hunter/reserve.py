@@ -37,7 +37,7 @@ from .runner import (
     signal_group_checked,
     terminate_tree,
 )
-from .watcher import HuntConfig, Hunter
+from .watcher import AvailabilityTracker, HuntConfig, Hunter
 
 __all__ = [
     "AcquireOptions",
@@ -157,10 +157,22 @@ class Reservation:
     uid: int
     full: bool = False
     version: int = STATE_VERSION
+    # Eager reservations may hold fewer GPUs than they are waiting for; the
+    # target is recorded so status/supervision know how many are still missing.
+    target_count: int | None = None
+    eager: bool = False
 
     @property
     def gpu_ids(self) -> list[int]:
         return [rec.index for rec in self.gpus]
+
+    @property
+    def target(self) -> int:
+        return self.target_count if self.target_count is not None else len(self.gpus)
+
+    @property
+    def missing(self) -> int:
+        return max(0, self.target - len(self.gpus))
 
     def remaining_s(self, now: float | None = None) -> float | None:
         if self.expires_at is None:
@@ -176,6 +188,8 @@ class Reservation:
             "expires_at": self.expires_at,
             "mem_mb": self.mem_mb,
             "full": self.full,
+            "target_count": self.target_count,
+            "eager": self.eager,
             "gpus": [rec.to_dict() for rec in self.gpus],
         }
 
@@ -196,6 +210,10 @@ class Reservation:
             uid=int(data["uid"]),
             full=bool(data.get("full", False)),
             version=int(data.get("version", STATE_VERSION)),
+            target_count=(
+                None if data.get("target_count") is None else int(data["target_count"])
+            ),
+            eager=bool(data.get("eager", False)),
         )
 
 
@@ -337,74 +355,110 @@ class _HoldFailed(ReserveError):
     pass
 
 
-def _hold_gpus(probe, gpus, opts: "AcquireOptions", *, emit: Emit, stop: threading.Event) -> Reservation:
+def _hold_one(
+    probe,
+    gpu: int,
+    opts: "AcquireOptions",
+    *,
+    emit: Emit,
+    stop: threading.Event,
+    timeout_s: float,
+) -> HogRecord:
+    """Start and verify one placeholder; on failure only this one is rolled back."""
     snap = _snapshot(probe)
-    if snap is None:
-        raise _HoldFailed("cannot read GPU state to start placeholders")
-    launched: list = []
-    records: list[HogRecord] = []
-    timeout_s = opts.hold_max_s if opts.hold_max_s and opts.hold_max_s > 0 else 0
+    gi = snap.get(gpu) if snap is not None else None
+    used_before = gi.mem_used_mb if gi is not None else 0
+    if opts.full:
+        if gi is None:
+            raise _HoldFailed(f"cannot read GPU{gpu} state for a full reservation")
+        mem_mb = gi.mem_free_mb - FULL_MARGIN_MB
+        if mem_mb <= 0:
+            raise _HoldFailed(f"GPU{gpu} has almost no free memory to hold")
+    else:
+        if not opts.mem_mb:
+            raise _HoldFailed("no memory amount configured")
+        mem_mb = int(opts.mem_mb)
+    cmd = hog_command(opts.hold_cmd, mem_mb, gpu, int(timeout_s))
+    log_path = _hog_log_path(gpu)
     try:
-        for gpu in gpus:
-            gi = snap.get(gpu)
-            used_before = gi.mem_used_mb if gi is not None else 0
-            if opts.full:
-                if gi is None:
-                    raise _HoldFailed(f"cannot read GPU{gpu} state for a full reservation")
-                mem_mb = gi.mem_free_mb - FULL_MARGIN_MB
-                if mem_mb <= 0:
-                    raise _HoldFailed(f"GPU{gpu} has almost no free memory to hold")
-            else:
-                if not opts.mem_mb:
-                    raise _HoldFailed("no memory amount configured")
-                mem_mb = int(opts.mem_mb)
-            cmd = hog_command(opts.hold_cmd, mem_mb, gpu, int(timeout_s))
-            log_path = _hog_log_path(gpu)
-            try:
-                proc, fout = launch(cmd, [gpu], log_path=log_path)
-            except OSError as e:
-                raise _HoldFailed(f"GPU{gpu}: cannot start placeholder: {e}") from e
-            close_log(fout)
-            launched.append(proc)
-            start_time = process_start_time(proc.pid)
-            if start_time is None:
-                raise _HoldFailed(
-                    f"GPU{gpu}: cannot record placeholder identity (pid {proc.pid})"
-                )
-            ok, reason = _wait_hold(
-                probe, proc, gpu, used_before, mem_mb,
-                opts.confirm_s, stop, log_path,
+        proc, fout = launch(cmd, [gpu], log_path=log_path)
+    except OSError as e:
+        raise _HoldFailed(f"GPU{gpu}: cannot start placeholder: {e}") from e
+    close_log(fout)
+    try:
+        start_time = process_start_time(proc.pid)
+        if start_time is None:
+            raise _HoldFailed(
+                f"GPU{gpu}: cannot record placeholder identity (pid {proc.pid})"
             )
-            if not ok:
-                raise _HoldFailed(f"GPU{gpu}: {reason}")
-            emit(f"holding GPU{gpu}: pid {proc.pid}, {mem_mb}MB")
-            records.append(
-                HogRecord(
-                    index=gpu,
-                    pid=proc.pid,
-                    start_time=start_time,
-                    mem_mb=mem_mb,
-                    used_before_mb=used_before,
-                    name=gi.name if gi is not None else "",
-                    log=str(log_path),
-                )
-            )
+        ok, reason = _wait_hold(
+            probe, proc, gpu, used_before, mem_mb,
+            opts.confirm_s, stop, log_path,
+        )
+        if not ok:
+            raise _HoldFailed(f"GPU{gpu}: {reason}")
     except BaseException:
-        for proc in launched:
-            terminate_tree(proc, term_wait=5.0)
+        terminate_tree(proc, term_wait=5.0)
         raise
-    mem_total = max(rec.mem_mb for rec in records)
-    created = time.time()
-    expires = created + opts.hold_max_s if opts.hold_max_s and opts.hold_max_s > 0 else None
+    emit(f"holding GPU{gpu}: pid {proc.pid}, {mem_mb}MB")
+    return HogRecord(
+        index=gpu,
+        pid=proc.pid,
+        start_time=start_time,
+        mem_mb=mem_mb,
+        used_before_mb=used_before,
+        name=gi.name if gi is not None else "",
+        log=str(log_path),
+    )
+
+
+def _terminate_records(records: list[HogRecord], *, term_wait: float = 5.0) -> None:
+    """Best-effort cleanup of held placeholders (used when acquisition aborts)."""
+    live = [rec for rec in records if rec.alive]
+    for rec in live:
+        signal_group_checked(rec.pid, rec.start_time, signal.SIGTERM)
+    remaining = _wait_processes_gone(live, term_wait)
+    _kill_processes(remaining, lambda _message: None)
+
+
+def _build_reservation(
+    records: list[HogRecord],
+    opts: "AcquireOptions",
+    *,
+    target_count: int,
+    eager: bool,
+    created_at: float | None = None,
+    expires_at: float | None = None,
+) -> Reservation:
+    created = time.time() if created_at is None else created_at
+    if expires_at is None and created_at is None and opts.hold_max_s and opts.hold_max_s > 0:
+        expires_at = created + opts.hold_max_s
     return Reservation(
-        mem_mb=mem_total,
-        gpus=records,
+        mem_mb=max(rec.mem_mb for rec in records),
+        gpus=list(records),
         created_at=created,
-        expires_at=expires,
+        expires_at=expires_at,
         hostname=socket.gethostname(),
         uid=os.getuid(),
         full=opts.full,
+        target_count=target_count,
+        eager=eager,
     )
+
+
+def _hold_gpus(probe, gpus, opts: "AcquireOptions", *, emit: Emit, stop: threading.Event) -> Reservation:
+    """Hold every GPU at once (non-eager mode); one failure rolls back all of them."""
+    timeout_s = opts.hold_max_s if opts.hold_max_s and opts.hold_max_s > 0 else 0
+    records: list[HogRecord] = []
+    try:
+        for gpu in gpus:
+            records.append(
+                _hold_one(probe, gpu, opts, emit=emit, stop=stop, timeout_s=timeout_s)
+            )
+    except BaseException:
+        _terminate_records(records)
+        raise
+    return _build_reservation(records, opts, target_count=len(records), eager=False)
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +470,7 @@ class AcquireOptions:
     need: int = 1
     mem_mb: int | None = None        # free memory required, also the amount to hold
     full: bool = False               # hold all free memory instead of mem_mb
+    eager: bool = False              # hold cards one by one as they become available
     prefer: tuple[int, ...] = ()
     allow: frozenset[int] | None = None
     idle_mem_mb: int = 500
@@ -427,9 +482,9 @@ class AcquireOptions:
     confirm_s: float = HOLD_CONFIRM_S
     max_polls: int | None = None     # tests
 
-    def hunt_config(self) -> HuntConfig:
+    def hunt_config(self, need: int | None = None) -> HuntConfig:
         return HuntConfig(
-            need=self.need,
+            need=self.need if need is None else need,
             mem_per_gpu_mb=None if self.full else self.mem_mb,
             prefer=self.prefer,
             allow=self.allow,
@@ -466,6 +521,116 @@ def _acquire_once(
     raise ReserveError("reserve aborted")
 
 
+def _update_partial_state(state: Reservation, *, must_exist: bool) -> None:
+    """Persist an in-progress eager reservation without holding the lock for long."""
+    with _state_lock():
+        current = load_state()
+        if must_exist:
+            if current is None:
+                raise StateGone("reservation state disappeared")
+        elif current is not None:
+            raise ReserveError(
+                f"a reservation is already active (GPU {current.gpu_ids}); "
+                "release it first with: gpu-hunter --release"
+            )
+        _save_state_locked(state)
+
+
+def _eager_acquire(
+    probe,
+    opts: AcquireOptions,
+    *,
+    emit: Emit,
+    stop: threading.Event,
+    on_attempt: Callable[[bool, str], None] | None = None,
+) -> Reservation:
+    """Hold GPUs one at a time, keeping every card as soon as it is stably idle.
+
+    Each iteration hunts for a single GPU (with a shared stability tracker, so
+    history is not thrown away between iterations), then starts and verifies a
+    placeholder for it.  The partial reservation is written to the state file
+    after every successful hold: ``--reserve-status`` shows ``held/target`` and
+    a concurrent ``--release`` can stop the acquisition.
+    """
+    tracker = AvailabilityTracker(opts.idle_mem_mb, opts.idle_util, opts.stable_rounds)
+    hunter = Hunter(
+        probe, opts.hunt_config(need=1), emit=emit, stop_event=stop,
+        on_attempt=on_attempt, tracker=tracker,
+    )
+    records: list[HogRecord] = []
+    created_at: float | None = None
+    expires_at: float | None = None
+    saved_once = False
+    backoff = max(opts.interval_s, 0.5)
+    try:
+        while len(records) < opts.need:
+            now = time.time()
+            if expires_at is not None and now >= expires_at:
+                raise ReserveError(
+                    "hold-max expired while waiting for the remaining GPU(s); "
+                    "the partially held reservation was released"
+                )
+            gpus = hunter.hunt()
+            if gpus is None:
+                raise ReserveError("reserve aborted while waiting for idle GPUs")
+            gpu = gpus[0]
+            if created_at is None:
+                created_at = time.time()
+                expires_at = (
+                    created_at + opts.hold_max_s
+                    if opts.hold_max_s and opts.hold_max_s > 0
+                    else None
+                )
+            remaining_s = 0.0 if expires_at is None else max(0.0, expires_at - time.time())
+            try:
+                record = _hold_one(
+                    probe, gpu, opts, emit=emit, stop=stop, timeout_s=remaining_s,
+                )
+            except _HoldFailed as e:
+                emit(
+                    f"warning: could not hold GPU{gpu} ({e}); "
+                    f"keeping {len(records)}/{opts.need} and retrying"
+                )
+                if stop.wait(backoff):
+                    raise ReserveError("reserve aborted while retrying placeholder launch")
+                backoff = min(backoff * 2, 60.0)
+                continue
+            records.append(record)
+            state = _build_reservation(
+                records, opts, target_count=opts.need, eager=True,
+                created_at=created_at, expires_at=expires_at,
+            )
+            try:
+                _update_partial_state(state, must_exist=saved_once)
+            except StateGone as e:
+                raise ReserveError(
+                    "reservation was released externally while it was being acquired"
+                ) from e
+            saved_once = True
+            missing = opts.need - len(records)
+            if missing:
+                ids = ",".join(str(rec.index) for rec in records)
+                emit(
+                    f"eager: held {len(records)}/{opts.need} GPU(s) (GPU {ids}); "
+                    f"waiting for {missing} more"
+                )
+        final = _build_reservation(
+            records, opts, target_count=opts.need, eager=True,
+            created_at=created_at, expires_at=expires_at,
+        )
+        try:
+            _update_partial_state(final, must_exist=True)
+        except StateGone as e:
+            raise ReserveError(
+                "reservation was released externally while it was being acquired"
+            ) from e
+        return final
+    except BaseException:
+        _terminate_records(records)
+        clear_state()
+        raise
+
+
 def acquire(
     probe,
     opts: AcquireOptions,
@@ -476,6 +641,15 @@ def acquire(
 ) -> Reservation:
     """Hunt for idle GPUs, hold them and persist the reservation."""
     stop = stop if stop is not None else threading.Event()
+    with _state_lock():
+        existing = load_state()
+        if existing is not None:
+            raise ReserveError(
+                f"a reservation is already active (GPU {existing.gpu_ids}); "
+                "release it first with: gpu-hunter --release"
+            )
+    if opts.eager:
+        return _eager_acquire(probe, opts, emit=emit, stop=stop, on_attempt=on_attempt)
     with _state_lock():
         existing = load_state()
         if existing is not None:
@@ -665,10 +839,17 @@ def status_report(probe=None) -> StatusReport:
 
     now = time.time()
     snap = _snapshot(probe) if probe is not None else None
-    lines = [
-        f"reservation active: {len(state.gpus)} GPU(s), "
-        f"{state.mem_mb}MB each" + (" (full card)" if state.full else "")
-    ]
+    total = state.target
+    if total > len(state.gpus):
+        lines = [
+            f"eager reservation in progress: {len(state.gpus)}/{total} GPU(s) held, "
+            f"{state.mem_mb}MB each" + (" (full card)" if state.full else "")
+        ]
+    else:
+        lines = [
+            f"reservation active: {len(state.gpus)} GPU(s), "
+            f"{state.mem_mb}MB each" + (" (full card)" if state.full else "")
+        ]
     lines.append(f"  host: {state.hostname or '?'}  uid: {state.uid}")
     created = f"  created: {_fmt_time(state.created_at)}"
     if state.expires_at is None:
@@ -706,6 +887,11 @@ def status_report(probe=None) -> StatusReport:
         )
     if probe is None:
         lines.append("  warning: GPU probing unavailable; only process state was checked")
+    if total > len(state.gpus):
+        lines.append(
+            f"  eager: waiting for {total - len(state.gpus)} more GPU(s) "
+            "(a foreground --reserve --eager must be running to make progress)"
+        )
     return StatusReport("\n".join(lines), 0 if healthy else 1, state, healthy)
 
 
@@ -772,16 +958,18 @@ class Supervisor:
             return "expired"
 
         snap = _snapshot(self.probe)
+        desired = state.target
         lost = [rec for rec in state.gpus if not self._record_ok(rec, snap)]
-        if lost:
+        missing = max(0, desired - (len(state.gpus) - len(lost)))
+        if lost or missing:
             for rec in lost:
                 self.emit(f"warning: reservation on GPU {rec.index} was lost (pid {rec.pid})")
                 if rec.alive:
                     signal_group_checked(rec.pid, rec.start_time, signal.SIGTERM)
             state.gpus = [rec for rec in state.gpus if rec not in lost]
-            self.emit(f"trying to re-acquire {len(lost)} GPU(s) to restore the reservation")
+            self.emit(f"trying to acquire {missing} GPU(s) to restore the reservation")
             replace_opts = replace(
-                self.opts, need=len(lost),
+                self.opts, need=missing,
                 mem_mb=self.opts.mem_mb, full=self.opts.full,
             )
             if state.expires_at is not None:

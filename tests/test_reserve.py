@@ -62,6 +62,26 @@ def record_for(proc: subprocess.Popen, index=0, mem_mb=1024) -> HogRecord:
     )
 
 
+def eager_frames(mem_mb=1024):
+    """Frames for an eager 2-GPU reservation: GPU0 first, GPU1 later."""
+    free0 = gpu(0, used=100)
+    busy1 = gpu(1, used=90000)
+    held0 = gpu(0, used=100 + mem_mb, pids=(4242,))
+    free1 = gpu(1, used=100)
+    held1 = gpu(1, used=100 + mem_mb, pids=(4242,))
+    return [
+        {0: free0, 1: busy1},   # hunt for GPU0
+        {0: free0, 1: busy1},
+        {0: free0, 1: busy1},   # baseline for the GPU0 placeholder
+        {0: held0, 1: busy1},   # GPU0 hold confirmed
+        {0: held0, 1: busy1},   # hunt for GPU1 (history is shared)
+        {0: held0, 1: free1},
+        {0: held0, 1: free1},   # GPU1 becomes stable
+        {0: held0, 1: free1},   # baseline for the GPU1 placeholder
+        {0: held0, 1: held1},   # GPU1 hold confirmed
+    ]
+
+
 class ReservationTestBase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -204,9 +224,12 @@ class HogCommandTest(unittest.TestCase):
 
 class AcquireTest(ReservationTestBase):
     def test_acquire_and_release_cycle(self):
+        # hunt x2 -> baseline/verify for GPU0 -> baseline/verify for GPU1
         frames = [
             free_frame((0, 1)),
             free_frame((0, 1)),
+            free_frame((0, 1)),
+            held_frame((0, 1), 1024),
             free_frame((0, 1)),
             held_frame((0, 1), 1024),
         ]
@@ -415,6 +438,133 @@ class SupervisorTest(ReservationTestBase):
 
 
 # ---------------------------------------------------------------------------
+# eager (partial) acquisition
+# ---------------------------------------------------------------------------
+
+class EagerTest(ReservationTestBase):
+    def _opts(self, **kw):
+        base = dict(need=2, mem_mb=1024, interval_s=0.005, stable_rounds=2,
+                    confirm_s=2.0, hold_cmd=sleep_cmd(), eager=True)
+        base.update(kw)
+        return AcquireOptions(**base)
+
+    def test_holds_cards_one_by_one_and_persists_progress(self):
+        probe = FakeProbe(eager_frames())
+        messages = []
+        saved = []
+        real_save = reserve_mod._save_state_locked
+
+        def spy(state):
+            saved.append((len(state.gpus), state.target_count, state.eager))
+            real_save(state)
+
+        with patch.object(reserve_mod, "_save_state_locked", side_effect=spy):
+            state = reserve_mod._eager_acquire(
+                probe, self._opts(), emit=messages.append, stop=threading.Event()
+            )
+        self.assertEqual(sorted(state.gpu_ids), [0, 1])
+        self.assertEqual(state.target_count, 2)
+        self.assertTrue(state.eager)
+        self.assertIn((1, 2, True), saved)
+        self.assertEqual(saved[-1], (2, 2, True))
+        self.assertTrue(any("eager: held 1/2" in m for m in messages))
+        loaded = load_state()
+        self.assertIsNotNone(loaded)
+        self.assertEqual(sorted(loaded.gpu_ids), [0, 1])
+        release(FakeProbe([free_frame((0, 1))]), emit=lambda m: None,
+                term_wait=5.0, free_wait=5.0)
+
+    def test_failed_hold_keeps_existing_cards_and_retries(self):
+        rec_a = HogRecord(index=0, pid=99_999_997, start_time=1, mem_mb=1024,
+                          used_before_mb=100)
+        rec_b = HogRecord(index=2, pid=99_999_996, start_time=1, mem_mb=1024,
+                          used_before_mb=100)
+        failed = reserve_mod._HoldFailed("preempted by another process")
+
+        class _FakeHunter:
+            def __init__(self, *args, **kwargs):
+                self._queue = [[0], [1], [2]]
+
+            def hunt(self):
+                return self._queue.pop(0)
+
+        messages = []
+        with patch.object(reserve_mod, "Hunter", _FakeHunter), \
+                patch.object(reserve_mod, "_hold_one",
+                             side_effect=[rec_a, failed, rec_b]):
+            state = reserve_mod._eager_acquire(
+                FakeProbe([]), self._opts(), emit=messages.append,
+                stop=threading.Event(),
+            )
+        self.assertEqual([rec.index for rec in state.gpus], [0, 2])
+        self.assertTrue(any("keeping 1/2" in m for m in messages))
+        reserve_mod.clear_state()
+
+    def test_hold_max_expiry_releases_the_partial_reservation(self):
+        rec = HogRecord(index=0, pid=99_999_995, start_time=1, mem_mb=1024)
+
+        class _FakeHunter:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def hunt(self):
+                return [0]
+
+        def slow_hold(*args, **kwargs):
+            time.sleep(0.02)
+            return rec
+
+        with patch.object(reserve_mod, "Hunter", _FakeHunter), \
+                patch.object(reserve_mod, "_hold_one", side_effect=slow_hold):
+            with self.assertRaises(ReserveError) as ctx:
+                reserve_mod._eager_acquire(
+                    FakeProbe([]), self._opts(hold_max_s=0.01),
+                    emit=lambda m: None, stop=threading.Event(),
+                )
+        self.assertIn("hold-max expired", str(ctx.exception))
+        self.assertIsNone(load_state())
+
+    def test_external_release_aborts_a_partial_acquisition(self):
+        calls = {"n": 0}
+
+        class _FakeHunter:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def hunt(self):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return [0]
+                reserve_mod.clear_state()
+                return [1]
+
+        records = [
+            HogRecord(index=0, pid=99_999_994, start_time=1, mem_mb=1024),
+            HogRecord(index=1, pid=99_999_993, start_time=1, mem_mb=1024),
+        ]
+        with patch.object(reserve_mod, "Hunter", _FakeHunter), \
+                patch.object(reserve_mod, "_hold_one", side_effect=records):
+            with self.assertRaises(ReserveError) as ctx:
+                reserve_mod._eager_acquire(
+                    FakeProbe([]), self._opts(), emit=lambda m: None,
+                    stop=threading.Event(),
+                )
+        self.assertIn("released externally", str(ctx.exception))
+        self.assertIsNone(load_state())
+
+    def test_status_reports_eager_progress(self):
+        proc = self.spawn_sleep()
+        state = self.make_state([record_for(proc, index=0, mem_mb=1024)])
+        state.target_count = 2
+        state.eager = True
+        self.save(state)
+        report = status_report(FakeProbe([{0: gpu(0, used=2048)}]))
+        self.assertEqual(report.exit_code, 0, report.text)
+        self.assertIn("eager reservation in progress: 1/2", report.text)
+        self.assertIn("waiting for 1 more GPU(s)", report.text)
+
+
+# ---------------------------------------------------------------------------
 # CLI integration
 # ---------------------------------------------------------------------------
 
@@ -449,6 +599,8 @@ class CliReserveTest(ReservationTestBase):
             free_frame((0, 1)),
             free_frame((0, 1)),
             held_frame((0, 1), 1024),
+            free_frame((0, 1)),
+            held_frame((0, 1), 1024),
         ]
         with patch("gpu_hunter.probe.NVMLProbe", fake_nvml_probe(frames)):
             rc = cli.main([
@@ -471,6 +623,20 @@ class CliReserveTest(ReservationTestBase):
             rc = cli.main([
                 "--release", "--run", "--grace", "0.05",
                 "--", sys.executable, "-c", "raise SystemExit(0)",
+            ])
+        self.assertEqual(rc, 0)
+        self.assertIsNone(load_state())
+
+    def test_eager_acquire_and_release(self):
+        from gpu_hunter import cli
+
+        with patch("gpu_hunter.probe.NVMLProbe", fake_nvml_probe(eager_frames())), \
+                patch.object(reserve_mod.Supervisor, "run", return_value="missing"), \
+                patch.object(reserve_mod, "_wait_gpus_free"):
+            rc = cli.main([
+                "--reserve", "--eager", "--gpu-num", "2", "--mem-per-gpu", "1G",
+                "--interval", "0.01", "--stable-rounds", "2",
+                "--hold-cmd", sleep_cmd(),
             ])
         self.assertEqual(rc, 0)
         self.assertIsNone(load_state())
@@ -535,6 +701,20 @@ class ModeValidationTest(ReservationTestBase):
                 "--reserve", "--mem-per-gpu", "1G", "--detach",
                 "--run", "--", "true",
             ])
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_eager_requires_reserve(self):
+        from gpu_hunter import cli
+
+        with self.assertRaises(SystemExit) as ctx:
+            cli.main(["--eager", "--", "true"])
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_eager_rejects_detach(self):
+        from gpu_hunter import cli
+
+        with self.assertRaises(SystemExit) as ctx:
+            cli.main(["--reserve", "--eager", "--detach", "--mem-per-gpu", "1G"])
         self.assertEqual(ctx.exception.code, 2)
 
     def test_reserve_status_rejects_a_command(self):

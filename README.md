@@ -124,6 +124,9 @@ gpu-hunter --reserve --gpu-num 2 --mem-per-gpu 12G
 # ... later: release and immediately run anything on the same cards
 gpu-hunter --release --run -- bash
 
+# grab the cards one by one as they free up, instead of waiting for both
+gpu-hunter --reserve --eager --gpu-num 2 --mem-per-gpu 12G
+
 # or hold in the background and release it later
 gpu-hunter --reserve --gpu-num 2 --mem-per-gpu 12G --detach
 gpu-hunter --reserve-status
@@ -148,6 +151,19 @@ How it behaves:
   Every reservation self-expires (`--hold-max`, default 12h; `0` means never).
 - `--reserve --run -- CMD` combines both: hold until Ctrl-C, then release and
   immediately run CMD on the same cards (atomic hand-off, no race window).
+- `--eager` changes *how* the cards are acquired: instead of requiring all N
+  to be stably idle at the same moment, gpu-hunter holds **each card as soon as
+  it becomes stably idle** and keeps hunting for the missing ones (preference
+  order applies to the currently available cards, so a free card is never
+  passed up while waiting for a "better" one). While waiting, the partial
+  reservation is already in the state file: `--reserve-status` shows
+  `eager: 1/2 held, waiting for 1 more` and `--release` can stop it. If
+  `--hold-max` expires before the set is complete, the partially held cards are
+  released and the command exits non-zero. `--eager` is foreground-only (no
+  supervisor would keep hunting in `--detach` mode); run it under tmux/nohup
+  for a long wait. An abnormal exit during the wait leaves the partial
+  reservation recoverable, but does not resume it automatically: `--release`
+  and start it again.
 - `--reserve-full` holds all remaining free memory instead of exactly
   `--mem-per-gpu` -- stronger isolation, but it wastes the rest of the card.
 - With `--detach` the command exits after acquiring; supervision is then
@@ -173,8 +189,9 @@ Notes:
   free memory can therefore fail to allocate and retry forever; use a
   slightly smaller value or `--reserve-full` (which keeps ~1G free) instead.
 
-Reserve options: `--reserve`, `--detach`, `--hold-max SEC`, `--reserve-full`,
-`--hold-cmd CMD`, `--reserve-status`, `--release`, `--run`, `--force`.
+Reserve options: `--reserve`, `--eager`, `--detach`, `--hold-max SEC`,
+`--reserve-full`, `--hold-cmd CMD`, `--reserve-status`, `--release`, `--run`,
+`--force`.
 
 ## How it works
 

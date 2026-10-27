@@ -120,6 +120,7 @@ Examples:
   # hold 2 x 12G for later use, Ctrl-C releases (or hand over a command)
   gpu-hunter --reserve --gpu-num 2 --mem-per-gpu 12G
   gpu-hunter --reserve --gpu-num 2 --mem-per-gpu 12G --detach
+  gpu-hunter --reserve --eager --gpu-num 2 --mem-per-gpu 12G  # grab cards one by one
   gpu-hunter --reserve-status
   gpu-hunter --release --run -- bash
 
@@ -187,6 +188,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reserve-full", dest="reserve_full", action="store_true",
                    help="with --reserve: hold all remaining free memory per GPU instead "
                         "of exactly --mem-per-gpu")
+    p.add_argument("--eager", action="store_true",
+                   help="with --reserve: hold each card as soon as it becomes stably idle "
+                        "instead of waiting for all of them at once (foreground only)")
     p.add_argument("--hold-cmd", dest="hold_cmd", default=None, metavar="CMD",
                    help="custom placeholder command for --reserve; {mem_mb}, {gpu} and "
                         "{timeout} are substituted (default: the built-in CUDA hog)")
@@ -445,6 +449,13 @@ def _resolve_mode(ns, cmd_tokens, parser) -> str:
         parser.error("--run is only valid with --reserve or --release")
     if ns.detach and ns.run:
         parser.error("--run cannot be combined with --detach")
+    if ns.eager and not ns.reserve:
+        parser.error("--eager is only valid with --reserve")
+    if ns.eager and ns.detach:
+        parser.error(
+            "--eager cannot be combined with --detach: no supervisor would keep "
+            "hunting for the missing GPUs (run it in the foreground under tmux/nohup)"
+        )
     if ns.workflow:
         if any(hold_modes):
             parser.error(
@@ -490,7 +501,7 @@ def _reserve_emit(progress: Progress | None):
     def emit(message: str) -> None:
         if progress is None:
             log.info("%s", message)
-        elif message.startswith(("warning:", "holding")):
+        elif message.startswith(("warning:", "holding", "eager:")):
             progress.say(message)
 
     return emit
@@ -516,6 +527,7 @@ def _reserve_options(ns):
         need=ns.gpu_num,
         mem_mb=ns.mem_per_gpu,
         full=ns.reserve_full,
+        eager=ns.eager,
         prefer=tuple(ns.prefer or ()),
         allow=frozenset(ns.allow) if ns.allow else None,
         idle_mem_mb=ns.idle_mem_mb,
